@@ -1,0 +1,61 @@
+services:
+  redis:
+    image: redis:8-alpine
+    user: "999:999"
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    restart: unless-stopped
+    mem_limit: 14g
+    memswap_limit: 14g
+    volumes:
+      - ./recovery-20261023/redis:/data
+      - ./secrets/redis-recovery.conf:/usr/local/etc/redis/redis.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$(sed -n 's/^requirepass //p' /usr/local/etc/redis/redis.conf) redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    networks:
+      amnet:
+        aliases: [agentmemory-redis]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+  agentmemory:
+    image: local/agentmemory:0.9.30-recovery-20261023
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: 8g
+    memswap_limit: 8g
+    cpus: 4
+    env_file: ./secrets/recovery-runtime.env
+    environment:
+      NODE_OPTIONS: --max-old-space-size=4096
+      MALLOC_ARENA_MAX: "2"
+    volumes:
+      - ./recovery-20261023/data:/data
+      - ./data/snapshots:/data/snapshots
+    depends_on:
+      redis: {condition: service_healthy}
+    networks: [amnet]
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+  frpc:
+    image: debian:bookworm-slim
+    command: ["/usr/local/bin/frpc", "-c", "/etc/frp/frpc.toml"]
+    restart: unless-stopped
+    env_file: ./secrets/recovery-frpc.env
+    volumes:
+      - /usr/local/bin/frpc:/usr/local/bin/frpc:ro
+      - ./frpc.toml:/etc/frp/frpc.toml:ro
+    depends_on:
+      agentmemory: {condition: service_healthy}
+    networks: [amnet]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+networks:
+  amnet:
+    driver: bridge

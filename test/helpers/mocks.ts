@@ -1,6 +1,11 @@
 import { vi } from "vitest";
+import { KV } from "../../src/state/schema.js";
 
 type Handler = (data: unknown) => Promise<unknown>;
+
+export function currentAuditScope(): string {
+  return KV.auditMonth(new Date().toISOString().slice(0, 7));
+}
 
 export function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -28,46 +33,13 @@ export function mockKV() {
     delete: async (scope: string, key: string): Promise<void> => {
       store.get(scope)?.delete(key);
     },
+    scan: async function* <T>(scope: string): AsyncGenerator<T> {
+      const entries = store.get(scope);
+      if (entries) yield* Array.from(entries.values()) as T[];
+    },
     list: async <T>(scope: string): Promise<T[]> => {
       const entries = store.get(scope);
       return entries ? (Array.from(entries.values()) as T[]) : [];
-    },
-    // 批量原语。生产实现（src/state/kv.ts）在分片 scope 下会把同一分片的
-    // key 合并成一次读改写，这里退化成逐条 Map 访问即可 —— 内存 store 没有
-    // 「读整个文件」的代价，两种实现的语义是一致的。
-    getMany: async <T>(
-      scope: string,
-      keys: readonly string[],
-    ): Promise<Map<string, T>> => {
-      const out = new Map<string, T>();
-      const rows = store.get(scope);
-      if (!rows) return out;
-      for (const key of keys) {
-        if (rows.has(key)) out.set(key, rows.get(key) as T);
-      }
-      return out;
-    },
-    setMany: async <T>(
-      scope: string,
-      pairs: ReadonlyArray<readonly [string, T]>,
-    ): Promise<void> => {
-      if (!store.has(scope)) store.set(scope, new Map());
-      const rows = store.get(scope)!;
-      for (const [key, value] of pairs) rows.set(key, value);
-    },
-    rewriteScope: async (
-      scope: string,
-      transform: (
-        rows: Record<string, unknown>,
-        shard: string,
-      ) => Record<string, unknown> | Promise<Record<string, unknown>>,
-    ): Promise<{ shards: number; rows: number }> => {
-      const rows = store.get(scope);
-      if (!rows || rows.size === 0) return { shards: 0, rows: 0 };
-      const next = await transform(Object.fromEntries(rows), scope);
-      rows.clear();
-      for (const [key, value] of Object.entries(next)) rows.set(key, value);
-      return { shards: 1, rows: rows.size };
     },
   };
 }

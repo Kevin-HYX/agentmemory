@@ -30,29 +30,17 @@ describe("fresh native engine startup", () => {
     );
     expect(spawnBody).toContain("activeStartupStderr.append(chunk)");
 
-    // 就绪等待上限是可配置的（AGENTMEMORY_READY_TIMEOUT_MS，默认 15s）：
-    // 引擎冷启动要反序列化整个 state_store，集群规模下远超 15s，写死上限会让
-    // 启动必然失败。这里断言调用点统一走常量，且超时分支仍然打印缓冲的 stderr。
-    const timeoutStart = source.indexOf("const ready = await waitForEngine(READY_TIMEOUT_MS)");
+    const timeoutStart = source.indexOf("const ready = await waitForEngine()");
     const timeoutEnd = source.indexOf('s.stop(c.ok("iii-engine is ready"))', timeoutStart);
     expect(source.slice(timeoutStart, timeoutEnd)).toContain(
       "printCapturedStartupStderr()",
     );
 
-    const demoTimeoutStart = source.indexOf("await waitForEngine(READY_TIMEOUT_MS)", timeoutEnd);
+    const demoTimeoutStart = source.indexOf("await waitForEngine()", timeoutEnd);
     const demoTimeoutEnd = source.indexOf("await import(\"./index.js\")", demoTimeoutStart);
     expect(source.slice(demoTimeoutStart, demoTimeoutEnd)).toContain(
       "printCapturedStartupStderr()",
     );
-  });
-
-  it("keeps the engine readiness deadline overridable with a 15s default", () => {
-    expect(source).toContain('process.env["AGENTMEMORY_READY_TIMEOUT_MS"]');
-    expect(source).toContain("return Number.isFinite(n) && n > 0 ? n : 15_000;");
-    // 不允许再出现写死的 15s 就绪等待：那会让大 state_store 的实例必然启动失败。
-    expect(source).not.toContain("waitForEngine(15000)");
-    expect(source).not.toContain("waitForAgentmemoryReady(15000)");
-    expect(source).not.toContain("within 15s");
   });
 
   it("exports the complete derived port set for Docker and native launchers", () => {
@@ -100,13 +88,13 @@ describe("fresh native engine startup", () => {
     const workerBody = source.slice(workerStart, workerEnd);
     expect(workerBody).toContain("readWorkerPidfile()");
     expect(workerBody).toContain("pidAlive(workerPid)");
-    expect(workerBody).toContain("waitForConfiguredWorker");
+    expect(workerBody).toContain("startWorkerAndWait");
+    expect(workerBody).toContain("engineStartsWorker: configuredEngineMayStartWorker");
     expect(workerBody).toContain('await import("./index.js")');
 
-    expect(source.match(/await startWorkerForEngineState\(\)/g)).toHaveLength(4);
-    expect(source).toContain(
-      "`agentmemory worker did not become ready within ${READY_TIMEOUT_MS / 1000}s.`",
-    );
+    expect(source.match(/await startWorkerForEngineState\(\)/g)).toHaveLength(5);
+    expect(source).toContain('startupTimeoutMessage("worker", timeoutMs)');
+    expect(source).not.toContain("waitForAgentmemoryReady(15000)");
   });
 
   it("stores lifecycle metadata per resolved instance and scopes Docker", () => {
@@ -119,7 +107,7 @@ describe("fresh native engine startup", () => {
   });
 
   it("keeps AGENTMEMORY_URL client-only and lets local port flags win", () => {
-    expect(source).toContain('const URL_CLIENT_COMMANDS = new Set(["status", "doctor", "mcp"])');
+    expect(source).toContain('const URL_CLIENT_COMMANDS = new Set(["status", "doctor", "mcp", "capture", "compression", "graph-index"])');
     expect(source).toContain("hasExplicitLocalPortOverride");
     expect(source).toContain("shouldUseAgentmemoryUrl()");
     expect(source).toContain('process.env["III_REST_PORT"] = String(base)');
@@ -139,7 +127,7 @@ describe("fresh native engine startup", () => {
     const mainBody = source.slice(mainStart, mainEnd);
     expect(mainBody).toContain("reconcilePersistedDockerEngine()");
     expect(mainBody.indexOf("reconcilePersistedDockerEngine()"))
-      .toBeLessThan(mainBody.indexOf("if (await isEngineRunning())"));
+      .toBeLessThan(mainBody.indexOf("if (await isEngineRunning() ||"));
   });
 
   it("keeps canonical compatibility and rejects Docker ownership on another port", () => {
@@ -159,5 +147,40 @@ describe("fresh native engine startup", () => {
     expect(spawnBody).toContain("if (!isDocker)");
     expect(spawnBody).toContain("clearEngineState()");
     expect(spawnBody).not.toContain("if (!isDocker) clearEnginePidfile();\n      clearEngineState();");
+  });
+
+  it("stops the launch instead of silently falling back to file when the redis rewrite fails", () => {
+    const prepareStart = source.indexOf("function prepareEngineLaunch");
+    const prepareEnd = source.indexOf("function startIiiBin", prepareStart);
+    const prepareBody = source.slice(prepareStart, prepareEnd);
+    expect(prepareBody).toContain("const stateBackendKind = getStateBackend();");
+    expect(prepareBody).toMatch(
+      /catch \(err\) \{\s*const failure = resolveLaunchRenderFailure\(stateBackendKind, err\);\s*if \(failure\.fatal\) \{\s*p\.log\.error\(failure\.message\);\s*process\.exit\(1\);\s*\}/,
+    );
+    expect(prepareBody).toContain(
+      'vlog(`runtime config generation failed, using bundled config verbatim: ${String(err)}`);',
+    );
+  });
+
+  it("rejects an unrecognized AGENTMEMORY_STATE_BACKEND before touching the engine", () => {
+    const engineStart = source.indexOf("async function startEngine");
+    const engineEnd = source.indexOf("async function waitForEngine", engineStart);
+    const engineBody = source.slice(engineStart, engineEnd);
+    expect(engineBody).toMatch(
+      /try \{\s*stateBackendKind = getStateBackend\(\);\s*\} catch \(err\) \{\s*p\.log\.error\(err instanceof Error \? err\.message : String\(err\)\);\s*process\.exit\(1\);\s*\}/,
+    );
+    expect(engineBody.match(/warnIfDockerIgnoresStateBackend\(stateBackendKind\)/g)).toHaveLength(2);
+  });
+
+  it("redacts credentials out of every engine stderr surface the CLI prints", () => {
+    expect(source).toContain(
+      "const stderr = redactCredentialUrls(activeStartupStderr.text().trim());",
+    );
+    expect(source).toContain(
+      "const stderr = redactCredentialUrls(activeStartupStderr.text());",
+    );
+    expect(source).toContain(
+      'const output = redactCredentialUrls(`${result.stdout ?? ""}${result.stderr ?? ""}`.trim());',
+    );
   });
 });

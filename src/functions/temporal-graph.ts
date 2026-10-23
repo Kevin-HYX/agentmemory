@@ -1,4 +1,8 @@
-import type { ISdk } from "iii-sdk";
+import { createGraphIndexReader, graphEdgeLookupKey, normalizeGraphIndexText } from "../state/graph-retrieval-index.js";
+import { persistGraphRecords } from "../state/graph-ingestion.js";
+import { readIndexedEntity } from "./graph-index-temporal.js";
+import { pinGraphState } from "../state/graph-generation.js";
+import type { IIIClient } from "iii-sdk";
 import type {
   GraphNode,
   GraphEdge,
@@ -8,20 +12,10 @@ import type {
   MemoryProvider,
 } from "../types.js";
 import { KV, generateId } from "../state/schema.js";
+import { boundSources } from "./graph.js";
 import type { StateKV } from "../state/kv.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import { logger } from "../logger.js";
-import {
-  hydrateEdgesObs,
-  hydrateNodesObs,
-  indexObsToNodes,
-  readEdgeObs,
-  readNodeObs,
-  stripEdgeObs,
-  stripNodeObs,
-  unionObs,
-  writeEdgeObs,
-  writeNodeObs,
-} from "../state/graph-provenance.js";
 
 const TEMPORAL_EXTRACTION_SYSTEM = `You are a temporal knowledge extraction engine. Given observations, extract entities AND their temporal relationships with full context metadata.
 
@@ -162,8 +156,8 @@ function parseTemporalGraphXml(
 }
 
 export function registerTemporalGraphFunctions(
-  sdk: ISdk,
-  kv: StateKV,
+  sdk: IIIClient,
+  state: StateKV,
   provider: MemoryProvider,
 ): void {
   sdk.registerFunction("mem::temporal-graph-extract", 
@@ -178,6 +172,7 @@ export function registerTemporalGraphFunctions(
         timestamp: string;
       }>;
     }) => {
+      const kv = await pinGraphState(state);
       if (!data.observations || data.observations.length === 0) {
         return { success: false, error: "No observations provided" };
       }
@@ -198,85 +193,94 @@ export function registerTemporalGraphFunctions(
         const obsIds = data.observations.map((o) => o.id);
         const { nodes, edges } = parseTemporalGraphXml(response, obsIds);
 
-        const existingNodes = await kv.list<GraphNode>(KV.graphNodes);
-        const existingEdges = await kv.list<GraphEdge>(KV.graphEdges);
-
-        const idRemap = new Map<string, string>();
-        for (const node of nodes) {
-          const existing = existingNodes.find(
-            (n) =>
-              n.name === node.name && n.type === node.type,
-          );
-          if (existing) {
-            const oldId = node.id;
-            // 来源数组已外置到 mem:graph:node-obs，合并前先取回旁路记录，
-            // 否则这次合并会把历史来源整条抹掉。
-            const mergedObs = unionObs(
-              await readNodeObs(kv, existing),
-              node.sourceObservationIds,
-              obsIds,
-            );
-            const merged = {
-              ...stripNodeObs(existing),
-              properties: { ...existing.properties, ...node.properties },
-              updatedAt: new Date().toISOString(),
-              aliases: [
-                ...new Set([
-                  ...(existing.aliases || []),
-                  ...(node.aliases || []),
-                ]),
-              ],
-            };
-            if (merged.aliases.length === 0) delete (merged as any).aliases;
-            await writeNodeObs(kv, existing.id, mergedObs);
-            await kv.set(KV.graphNodes, existing.id, merged);
-            await indexObsToNodes(kv, [existing.id], obsIds);
-            node.id = existing.id;
-            idRemap.set(oldId, existing.id);
-          } else {
-            await writeNodeObs(kv, node.id, unionObs(node.sourceObservationIds, obsIds));
-            await kv.set(KV.graphNodes, node.id, stripNodeObs(node));
-            await indexObsToNodes(kv, [node.id], obsIds);
-            // 保留未剥离的副本供同批次后续查重（它带着来源数组，但读取一律
-            // 先查旁路记录，所以这里保持一致即可）。
-            existingNodes.push(node);
-          }
-        }
-
-        for (const edge of edges) {
-          if (idRemap.has(edge.sourceNodeId)) {
-            edge.sourceNodeId = idRemap.get(edge.sourceNodeId)!;
-          }
-          if (idRemap.has(edge.targetNodeId)) {
-            edge.targetNodeId = idRemap.get(edge.targetNodeId)!;
-          }
-          const existingKey = `${edge.sourceNodeId}|${edge.targetNodeId}|${edge.type}`;
-          const existingEdge = existingEdges.find(
-            (e) =>
-              `${e.sourceNodeId}|${e.targetNodeId}|${e.type}` ===
-              existingKey,
-          );
-
-          if (existingEdge) {
-            const updatedOld = {
-              ...stripEdgeObs(existingEdge),
-              isLatest: false,
-              tvalidEnd:
-                existingEdge.tvalidEnd || new Date().toISOString(),
-              supersededBy: edge.id,
-            };
-            await writeEdgeObs(kv, existingEdge.id, await readEdgeObs(kv, existingEdge));
-            await kv.set(KV.graphEdges, existingEdge.id, updatedOld);
-
-            await kv.set(KV.graphEdgeHistory, existingEdge.id, updatedOld);
-
-            edge.version = (existingEdge.version || 1) + 1;
+        await withKeyedLock("graph:persist", async () => {
+          const idRemap = new Map<string, string>();
+          for (const node of nodes) {
+            const reader = await createGraphIndexReader(kv);
+            if (!reader) throw new Error("Graph index unavailable; run agentmemory graph-index migrate --allow-legacy-scan");
+            const names = await reader.posting("name", normalizeGraphIndexText(node.name), { limit: 64 });
+            let existing: GraphNode | null = null;
+            for (const id of names.ids) {
+              const candidate = await reader.getNode(id);
+              if (candidate && !candidate.stale && candidate.name === node.name && candidate.type === node.type && (!existing || candidate.id < existing.id)) {
+                existing = await kv.get<GraphNode>(KV.graphNodes, id);
+              }
+            }
+            if (names.cursor || reader.exhausted || !await reader.finish()) throw new Error("Temporal node reconciliation exceeded the graph read budget or changed revision");
+            if (existing) {
+              const oldId = node.id;
+              const merged = {
+                ...existing,
+                sourceObservationIds: boundSources(
+                  existing.sourceObservationIds ?? [],
+                  node.sourceObservationIds ?? [],
+                ),
+                properties: { ...existing.properties, ...node.properties },
+                updatedAt: new Date().toISOString(),
+                aliases: [
+                  ...new Set([
+                    ...(existing.aliases || []),
+                    ...(node.aliases || []),
+                  ]),
+                ],
+              };
+              if (merged.aliases.length === 0) delete (merged as any).aliases;
+              await persistGraphRecords(kv, [merged], []);
+              node.id = existing.id;
+              idRemap.set(oldId, existing.id);
+            } else {
+              node.sourceObservationIds = boundSources([], node.sourceObservationIds ?? []);
+              await persistGraphRecords(kv, [node], []);
+            }
           }
 
-          await writeEdgeObs(kv, edge.id, unionObs(edge.sourceObservationIds, obsIds));
-          await kv.set(KV.graphEdges, edge.id, stripEdgeObs(edge));
-          existingEdges.push(edge);
-        }
+          for (const edge of edges) {
+            if (idRemap.has(edge.sourceNodeId)) {
+              edge.sourceNodeId = idRemap.get(edge.sourceNodeId)!;
+            }
+            if (idRemap.has(edge.targetNodeId)) {
+              edge.targetNodeId = idRemap.get(edge.targetNodeId)!;
+            }
+            const reader = await createGraphIndexReader(kv);
+            if (!reader) throw new Error("Graph index unavailable during temporal reconciliation");
+            let cursor: string | undefined;
+            let existingEdge: GraphEdge | null = null;
+            do {
+              const page = await reader.posting("edgeKey", graphEdgeLookupKey(edge), { cursor, limit: 64 });
+              for (const id of page.ids) {
+                const candidate = await reader.getEdge(id);
+                if (candidate && !candidate.stale && candidate.isLatest !== false &&
+                    candidate.sourceNodeId === edge.sourceNodeId && candidate.targetNodeId === edge.targetNodeId && candidate.type === edge.type &&
+                    (!existingEdge || (candidate.version ?? 1) > (existingEdge.version ?? 1) ||
+                      (candidate.version ?? 1) === (existingEdge.version ?? 1) && candidate.id < existingEdge.id)) {
+                  const canonical = await reader.read<GraphEdge>(KV.graphEdges, id);
+                  if (reader.exhausted) break;
+                  if (!canonical || canonical.id !== id || canonical.stale || canonical.isLatest === false || graphEdgeLookupKey(canonical) !== graphEdgeLookupKey(edge)) {
+                    throw new Error("Temporal edge reconciliation found a missing or changed canonical predecessor");
+                  }
+                  existingEdge = canonical;
+                }
+              }
+              cursor = page.cursor ?? undefined;
+            } while (cursor && !reader.exhausted);
+            if (cursor || reader.exhausted || !await reader.finish()) throw new Error("Temporal edge reconciliation exceeded the graph read budget or changed revision");
+            edge.sourceObservationIds = boundSources([], edge.sourceObservationIds ?? []);
+            if (existingEdge) {
+              const updatedOld = {
+                ...existingEdge,
+                isLatest: false,
+                tvalidEnd:
+                  existingEdge.tvalidEnd || new Date().toISOString(),
+                supersededBy: edge.id,
+              };
+              edge.version = (existingEdge.version || 1) + 1;
+              await persistGraphRecords(kv, [], [updatedOld, edge]);
+              await kv.set(KV.graphEdgeHistory, existingEdge.id, updatedOld);
+            } else {
+              await persistGraphRecords(kv, [], [edge]);
+            }
+          }
+        });
 
         logger.info("Temporal graph extraction complete", {
           nodes: nodes.length,
@@ -300,51 +304,13 @@ export function registerTemporalGraphFunctions(
       entityName: string;
       asOf?: string;
       includeHistory?: boolean;
-    }): Promise<TemporalState | { error: string }> => {
-      const allNodes = await kv.list<GraphNode>(KV.graphNodes);
-      const allEdges = await kv.list<GraphEdge>(KV.graphEdges);
-
-      const entity = allNodes.find(
-        (n) =>
-          n.name.toLowerCase() === data.entityName.toLowerCase() ||
-          (n.aliases &&
-            n.aliases.some(
-              (a) =>
-                a.toLowerCase() === data.entityName.toLowerCase(),
-            )),
-      );
-
-      if (!entity) {
-        return { error: `Entity "${data.entityName}" not found` } as any;
-      }
-
-      const relatedEdges = allEdges.filter(
-        (e) => e.sourceNodeId === entity.id || e.targetNodeId === entity.id,
-      );
-
-      const historicalEdges = await kv
-        .list<GraphEdge>(KV.graphEdgeHistory)
-        .catch(() => [] as GraphEdge[]);
-      const entityHistory = historicalEdges.filter(
-        (e) => e.sourceNodeId === entity.id || e.targetNodeId === entity.id,
-      );
-
-      const allEntityEdges = [...relatedEdges, ...entityHistory];
-
-      // 返回值里带实体与边，来源数组必须补回来（热行里恒为空）。
-      // 关联边数量受实体度数约束，不是全量规模，这里一次批量读即可。
-      // 注意 graph:edge-history 里的行与 graph:edges 共用同一个边 id，
-      // 因此也由同一份 edge-obs 旁路记录覆盖。
-      const [hydratedEntity, hydratedEntityEdges] = await Promise.all([
-        hydrateNodesObs(kv, [entity]),
-        hydrateEdgesObs(kv, allEntityEdges),
-      ]);
-      const hydratedById = new Map(
-        hydratedEntityEdges.map((e) => [e.id, e] as const),
-      );
-      const hydratedOf = (edge: GraphEdge): GraphEdge =>
-        hydratedById.get(edge.id) ?? edge;
-      const resolvedEntity = hydratedEntity[0] ?? entity;
+    }): Promise<(TemporalState & { truncated: boolean }) | { error: string }> => {
+      const kv = await pinGraphState(state);
+      if (data.asOf !== undefined && !Number.isFinite(Date.parse(data.asOf))) return { error: "Invalid asOf timestamp" };
+      const indexed = await readIndexedEntity(kv, data.entityName);
+      if ("error" in indexed) return indexed;
+      const { entity, relatedEdges, entityHistory, truncated } = indexed;
+      const allEntityEdges = [...new Map([...entityHistory, ...relatedEdges].map(edge => [edge.id, edge])).values()];
 
       if (data.asOf) {
         const asOfTime = new Date(data.asOf).getTime();
@@ -368,10 +334,11 @@ export function registerTemporalGraphFunctions(
         const historical = data.includeHistory ? validEdges : [];
 
         return {
-          entity: resolvedEntity,
-          currentEdges: currentEdges.map(hydratedOf),
-          historicalEdges: historical.map(hydratedOf),
-          timeline: buildTimeline(allEntityEdges.map(hydratedOf)),
+          entity,
+          truncated,
+          currentEdges,
+          historicalEdges: historical,
+          timeline: buildTimeline(allEntityEdges),
         };
       }
 
@@ -380,12 +347,11 @@ export function registerTemporalGraphFunctions(
       );
 
       return {
-        entity: resolvedEntity,
-        currentEdges: currentEdges.map(hydratedOf),
-        historicalEdges: data.includeHistory
-          ? entityHistory.map(hydratedOf)
-          : [],
-        timeline: buildTimeline(allEntityEdges.map(hydratedOf)),
+        entity,
+        truncated,
+        currentEdges,
+        historicalEdges: data.includeHistory ? allEntityEdges.filter(edge => edge.isLatest === false) : [],
+        timeline: buildTimeline(allEntityEdges),
       };
     },
   );
@@ -396,27 +362,14 @@ export function registerTemporalGraphFunctions(
       from?: string;
       to?: string;
     }) => {
-      const allNodes = await kv.list<GraphNode>(KV.graphNodes);
-      const allEdges = await kv.list<GraphEdge>(KV.graphEdges);
-      const historicalEdges = await kv
-        .list<GraphEdge>(KV.graphEdgeHistory)
-        .catch(() => [] as GraphEdge[]);
-
-      const entity = allNodes.find(
-        (n) => n.name.toLowerCase() === data.entityName.toLowerCase(),
-      );
-      if (!entity) return { error: "Entity not found" };
-
-      const allEntityEdges = [
-        ...allEdges.filter(
-          (e) =>
-            e.sourceNodeId === entity.id || e.targetNodeId === entity.id,
-        ),
-        ...historicalEdges.filter(
-          (e) =>
-            e.sourceNodeId === entity.id || e.targetNodeId === entity.id,
-        ),
-      ];
+      const kv = await pinGraphState(state);
+      if ((data.from !== undefined && !Number.isFinite(Date.parse(data.from))) ||
+          (data.to !== undefined && !Number.isFinite(Date.parse(data.to)))) return { error: "Invalid temporal range" };
+      if (data.from && data.to && Date.parse(data.from) > Date.parse(data.to)) return { error: "Temporal range is reversed" };
+      const indexed = await readIndexedEntity(kv, data.entityName, false);
+      if ("error" in indexed) return indexed;
+      const { entity, relatedEdges, entityHistory, truncated } = indexed;
+      const allEntityEdges = [...new Map([...entityHistory, ...relatedEdges].map(edge => [edge.id, edge])).values()];
 
       allEntityEdges.sort(
         (a, b) =>
@@ -452,6 +405,7 @@ export function registerTemporalGraphFunctions(
 
       return {
         entity: entity.name,
+        truncated,
         totalChanges: changes.length,
         changes,
       };

@@ -33,6 +33,10 @@ function mockKV() {
     delete: async (scope: string, key: string): Promise<void> => {
       store.get(scope)?.delete(key);
     },
+    scan: async function* <T>(scope: string): AsyncGenerator<T> {
+      const entries = store.get(scope);
+      if (entries) yield* Array.from(entries.values()) as T[];
+    },
     list: async <T>(scope: string): Promise<T[]> => {
       const entries = store.get(scope);
       return entries ? (Array.from(entries.values()) as T[]) : [];
@@ -763,7 +767,7 @@ describe("Diagnostics Functions", () => {
       expect(result.checks.some((c) => c.category === "summaries")).toBe(true);
     });
 
-    describe("defensive row-shape handling (CodeRabbit #473 review)", () => {
+    describe("defensive row-shape handling", () => {
       it("NaN/Infinity confidence on a lesson is flagged as warn, not silently passed", async () => {
         await kv.set(KV.lessons, "lsn_nan", {
           id: "lsn_nan", content: "x", context: "", confidence: NaN,

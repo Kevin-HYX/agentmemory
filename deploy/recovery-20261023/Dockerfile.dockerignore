@@ -1,0 +1,7 @@
+.git
+node_modules
+website
+.env
+.env.*
+!.env.example
+deploy/**/migrate/target

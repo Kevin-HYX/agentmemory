@@ -1,16 +1,10 @@
-import type { ISdk } from "iii-sdk";
+import { pinGraphState } from "../state/graph-generation.js";
+import { persistGraphRecords } from "../state/graph-ingestion.js";
+import type { IIIClient } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV, generateId } from "../state/schema.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { recordAudit } from "./audit.js";
-import {
-  hydrateEdgesObs,
-  hydrateNodesObs,
-  stripEdgeObs,
-  stripNodeObs,
-  writeEdgeObs,
-  writeNodeObs,
-} from "../state/graph-provenance.js";
 import type {
   MeshPeer,
   Memory,
@@ -88,10 +82,6 @@ async function lwwMergeList<T extends { id: string }>(
   items: T[] | undefined,
   lockPrefix: string,
   tsField: "updatedAt" | "createdAt",
-  // 写入前的钩子。图谱行需要先把来源数组搬到旁路 scope、再把热行置空
-  // （见 state/graph-provenance.ts），这件事与 LWW 合并无关，所以用回调
-  // 注入，而不是把图谱专用的分支塞进这个通用函数。
-  beforeWrite?: (item: T) => Promise<T>,
 ): Promise<number> {
   if (!items || !Array.isArray(items)) return 0;
   let count = 0;
@@ -102,12 +92,12 @@ async function lwwMergeList<T extends { id: string }>(
     const wrote = await withKeyedLock(`${lockPrefix}:${item.id}`, async () => {
       const existing = await kv.get<T>(scope, item.id);
       if (!existing) {
-        await kv.set(scope, item.id, beforeWrite ? await beforeWrite(item) : item);
+        await kv.set(scope, item.id, item);
         return true;
       }
       const existingTs = (existing as Record<string, unknown>)[tsField] as string;
       if (new Date(ts) > new Date(existingTs)) {
-        await kv.set(scope, item.id, beforeWrite ? await beforeWrite(item) : item);
+        await kv.set(scope, item.id, item);
         return true;
       }
       return false;
@@ -115,54 +105,18 @@ async function lwwMergeList<T extends { id: string }>(
     if (wrote) count++;
   }
   return count;
-}
-
-// 边从 mesh 同步进来时同样带着来源数组（发送侧已 hydrate），落盘按新约定拆分。
-function graphEdgeWriteHook(kv: StateKV) {
-  return async (edge: GraphEdge): Promise<GraphEdge> => {
-    await writeEdgeObs(kv, edge.id, edge.sourceObservationIds ?? []);
-    return stripEdgeObs(edge);
-  };
 }
 
 function graphNodeTs(node: GraphNode): string {
   return node.updatedAt || node.createdAt;
 }
 
-async function lwwMergeGraphNodes(
-  kv: StateKV,
-  items: GraphNode[] | undefined,
-): Promise<number> {
-  if (!items || !Array.isArray(items)) return 0;
-  let count = 0;
-  for (const item of items) {
-    if (!item.id || typeof item.id !== "string") continue;
-    const ts = graphNodeTs(item);
-    if (!ts || Number.isNaN(new Date(ts).getTime())) continue;
-    const wrote = await withKeyedLock(`mem:gnode:${item.id}`, async () => {
-      const existing = await kv.get<GraphNode>(KV.graphNodes, item.id);
-      if (!existing) {
-        await writeNodeObs(kv, item.id, item.sourceObservationIds ?? []);
-        await kv.set(KV.graphNodes, item.id, stripNodeObs(item));
-        return true;
-      }
-      if (new Date(ts) > new Date(graphNodeTs(existing))) {
-        await writeNodeObs(kv, item.id, item.sourceObservationIds ?? []);
-        await kv.set(KV.graphNodes, item.id, stripNodeObs(item));
-        return true;
-      }
-      return false;
-    });
-    if (wrote) count++;
-  }
-  return count;
-}
-
 export function registerMeshFunction(
-  sdk: ISdk,
-  kv: StateKV,
+  sdk: IIIClient,
+  state: StateKV,
   meshAuthToken?: string,
 ): void {
+  const kv = state;
   sdk.registerFunction("mem::mesh-register",
     async (data: {
       url: string;
@@ -217,6 +171,7 @@ export function registerMeshFunction(
 
   sdk.registerFunction("mem::mesh-sync",
     async (data: { peerId?: string; scopes?: string[]; direction?: "push" | "pull" | "both" }) => {
+      const kv = await pinGraphState(state);
       if (!meshAuthToken) {
         return {
           success: false,
@@ -356,6 +311,7 @@ export function registerMeshFunction(
 
   sdk.registerFunction("mem::mesh-receive",
     async (data: MeshSyncPayload) => {
+      const kv = await pinGraphState(state);
       if (!data || typeof data !== "object") {
         return { success: false, error: "payload required" };
       }
@@ -382,15 +338,13 @@ export function registerMeshFunction(
           });
         }
       }
-      accepted += await lwwMergeGraphNodes(kv, data.graphNodes);
-      accepted += await lwwMergeList(
-          kv,
-          KV.graphEdges,
-          data.graphEdges,
-          "mem:gedge",
-          "createdAt",
-          graphEdgeWriteHook(kv),
-        );
+      const graph = await persistGraphRecords(
+        kv,
+        Array.isArray(data.graphNodes) ? data.graphNodes : [],
+        Array.isArray(data.graphEdges) ? data.graphEdges : [],
+        { mode: "lww" },
+      );
+      accepted += graph.nodesWritten + graph.edgesWritten;
       await recordAudit(kv, "mesh_sync", "mem::mesh-receive", [], {
         action: "mesh.receive",
         accepted,
@@ -466,18 +420,14 @@ async function collectSyncData(
 
   if (scopes.includes("graph:nodes") && !projectScoped) {
     const all = await kv.list<GraphNode>(KV.graphNodes);
-    // 同步载荷必须带上来源数组，否则对端合并后会丢掉来源链
-    // （接收侧的 lwwMergeGraphNodes 正是把它写进旁路 scope 的）。
-    const delta = all.filter(
+    result.graphNodes = all.filter(
       (n) => new Date(graphNodeTs(n)).getTime() > sinceTime,
     );
-    result.graphNodes = await hydrateNodesObs(kv, delta);
   }
 
   if (scopes.includes("graph:edges") && !projectScoped) {
     const all = await kv.list<GraphEdge>(KV.graphEdges);
-    const delta = deltaFilter(all, sinceTime, "createdAt");
-    result.graphEdges = await hydrateEdgesObs(kv, delta);
+    result.graphEdges = deltaFilter(all, sinceTime, "createdAt");
   }
 
   return result;
@@ -517,19 +467,13 @@ async function applySyncData(
       if (wrote) applied++;
     }
   }
-  if (scopes.includes("graph:nodes")) {
-    applied += await lwwMergeGraphNodes(kv, data.graphNodes);
-  }
-  if (scopes.includes("graph:edges")) {
-    applied += await lwwMergeList(
-          kv,
-          KV.graphEdges,
-          data.graphEdges,
-          "mem:gedge",
-          "createdAt",
-          graphEdgeWriteHook(kv),
-        );
-  }
+  const graph = await persistGraphRecords(
+    kv,
+    scopes.includes("graph:nodes") && Array.isArray(data.graphNodes) ? data.graphNodes : [],
+    scopes.includes("graph:edges") && Array.isArray(data.graphEdges) ? data.graphEdges : [],
+    { mode: "lww" },
+  );
+  applied += graph.nodesWritten + graph.edgesWritten;
 
   return applied;
 }

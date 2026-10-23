@@ -45,26 +45,6 @@ function mockKV() {
     },
     list: async <T>(scope: string): Promise<T[]> =>
       Array.from(store.get(scope)?.values() ?? []) as T[],
-    getMany: async <T>(
-      scope: string,
-      keys: readonly string[],
-    ): Promise<Map<string, T>> => {
-      const out = new Map<string, T>();
-      const rows = store.get(scope);
-      if (!rows) return out;
-      for (const key of keys) {
-        if (rows.has(key)) out.set(key, rows.get(key) as T);
-      }
-      return out;
-    },
-    setMany: async <T>(
-      scope: string,
-      pairs: ReadonlyArray<readonly [string, T]>,
-    ): Promise<void> => {
-      if (!store.has(scope)) store.set(scope, new Map());
-      const rows = store.get(scope)!;
-      for (const [key, value] of pairs) rows.set(key, value);
-    },
     _store: store,
   };
 }
@@ -152,6 +132,7 @@ describe("mem::graph::import-graphify", () => {
 
   beforeEach(() => {
     tmp = mkdtempSync(join(tmpdir(), "am-graphify-"));
+    process.env.AGENTMEMORY_IMPORT_ROOT = tmp;
     mkdirSync(join(tmp, "graphify-out"), { recursive: true });
     writeFileSync(join(tmp, "graphify-out", "graph.json"), JSON.stringify(FIXTURE));
     kv = mockKV();
