@@ -15,6 +15,24 @@ function mockKV(
   for (const e of edges) edgesMap.set(e.id, e);
   store.set("mem:graph:edges", edgesMap);
 
+  // 反向索引 obsId -> nodeId[]。
+  //
+  // 生产侧的写入路径（persistGraphDelta）会维护这份索引，而 expandFromChunks
+  // 现在靠它定位种子节点（旧实现是全量扫节点，正是内存溢出的来源）。
+  // 这里按同样的规则从节点出发重建，规则与时序都对齐生产：每个 obsId 封顶
+  // OBS_INDEX_CAP 条，按节点出现顺序取前若干个。
+  const OBS_INDEX_CAP = 64;
+  const obsIndex = new Map<string, string[]>();
+  for (const n of nodes) {
+    for (const obsId of n.sourceObservationIds ?? []) {
+      const list = obsIndex.get(obsId) ?? [];
+      if (list.length >= OBS_INDEX_CAP) continue;
+      if (!list.includes(n.id)) list.push(n.id);
+      obsIndex.set(obsId, list);
+    }
+  }
+  store.set("mem:graph:obs-index", obsIndex as Map<string, unknown>);
+
   return {
     get: async <T>(scope: string, key: string): Promise<T | null> => {
       return (store.get(scope)?.get(key) as T) ?? null;
@@ -30,6 +48,26 @@ function mockKV(
     list: async <T>(scope: string): Promise<T[]> => {
       const entries = store.get(scope);
       return entries ? (Array.from(entries.values()) as T[]) : [];
+    },
+    getMany: async <T>(
+      scope: string,
+      keys: readonly string[],
+    ): Promise<Map<string, T>> => {
+      const out = new Map<string, T>();
+      const rows = store.get(scope);
+      if (!rows) return out;
+      for (const key of keys) {
+        if (rows.has(key)) out.set(key, rows.get(key) as T);
+      }
+      return out;
+    },
+    setMany: async <T>(
+      scope: string,
+      pairs: ReadonlyArray<readonly [string, T]>,
+    ): Promise<void> => {
+      if (!store.has(scope)) store.set(scope, new Map());
+      const rows = store.get(scope)!;
+      for (const [key, value] of pairs) rows.set(key, value);
     },
   };
 }
@@ -272,6 +310,36 @@ describe("GraphRetrieval", () => {
     expect(root).toBeDefined();
     expect(root!.score).toBe(1.0);
     expect(root!.pathLength).toBe(0);
+  });
+
+  it("keeps a start node's observation at 1.0 even when a weaker path also reaches it (#provenance review)", async () => {
+    // Regression for an ordering bug the provenance rewrite surfaced: obsId
+    // ownership used to be decided by discovery order. When a depth-2 path
+    // reached a node that shared an observation with the start node, the path
+    // emitted it first at its own (much lower) path score, the start node's
+    // 1.0 emission was then swallowed by the visitedObs guard, and a direct
+    // observation of the queried entity got ranked as if it were two hops away.
+    //
+    // Measured on real data: for the query "obsidian" the pre-fix code returned
+    // the same 20 observations but scored all of them 0.2 instead of 1.0.
+    const nodes = [
+      makeNode("n1", "React", "library", ["obs_shared", "obs_root"]),
+      makeNode("n2", "Hook", "concept", ["obs_mid"]),
+      makeNode("n3", "State", "concept", ["obs_shared"]),
+    ];
+    const edges = [
+      makeEdge("e1", "n1", "n2", "uses", 0.8),
+      makeEdge("e2", "n2", "n3", "related_to", 0.8),
+    ];
+    const kv = mockKV(nodes, edges);
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.searchByEntities(["React"], 2);
+    const shared = results.find((r) => r.obsId === "obs_shared");
+    expect(shared).toBeDefined();
+    expect(shared!.score).toBe(1.0);
+    expect(shared!.pathLength).toBe(0);
+    expect(shared!.graphContext).toBe("[library] React");
   });
 
   it("respects maxDepth bound (Dijkstra stops at edge-count depth)", async () => {

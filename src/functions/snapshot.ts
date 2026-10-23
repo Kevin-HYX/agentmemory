@@ -13,6 +13,11 @@ import type {
 import { KV, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
+import {
+  hydrateNodesObs,
+  stripNodeObs,
+  writeNodeObs,
+} from "../state/graph-provenance.js";
 import { VERSION } from "../version.js";
 import { logger } from "../logger.js";
 
@@ -60,7 +65,10 @@ export function registerSnapshotFunction(
 
         const sessions = await kv.list<Session>(KV.sessions);
         const memories = await kv.list<Memory>(KV.memories);
-        const graphNodes = await kv.list<GraphNode>(KV.graphNodes);
+        const graphNodes = await hydrateNodesObs(
+          kv,
+          await kv.list<GraphNode>(KV.graphNodes),
+        );
         const accessLogs = await kv
           .list<AccessLogExport>(KV.accessLog)
           .catch(() => [] as AccessLogExport[]);
@@ -204,8 +212,13 @@ export function registerSnapshotFunction(
           }
         }
         if (state.graphNodes) {
-          for (const node of state.graphNodes) {
-            await kv.set(KV.graphNodes, node.id, node);
+          for (const raw of state.graphNodes) {
+            // 快照里的节点带着来源数组（捕获侧已 hydrate），恢复时按新约定
+            // 拆分落盘：旁路记录 + 置空的热行。快照 JSON 是弱类型（只保证有
+            // id），这里按落盘时的实际形状断言。
+            const node = raw as unknown as GraphNode;
+            await writeNodeObs(kv, node.id, node.sourceObservationIds ?? []);
+            await kv.set(KV.graphNodes, node.id, stripNodeObs(node));
           }
         }
         if (state.observations) {

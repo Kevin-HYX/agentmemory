@@ -94,6 +94,15 @@ const IS_VERBOSE =
 // 25-line `[agentmemory] X registered` stream is either dropped or
 // printed verbatim. Without this the worker's default (env-only) would
 // disagree with the CLI flag.
+// iii 引擎就绪等待上限。上游硬编码 15s，但引擎冷启动要反序列化整个
+// state_store（数百 MB / 上千个分片文件），实测需要 20-30s，于是必然
+// 判定 "worker did not become ready" 并退出。允许用环境变量放宽。
+const READY_TIMEOUT_MS = (() => {
+  const raw = process.env["AGENTMEMORY_READY_TIMEOUT_MS"];
+  const n = raw ? Number(raw) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : 15_000;
+})();
+
 setBootVerbose(IS_VERBOSE);
 
 const IS_RESET = args.includes("--reset");
@@ -1835,8 +1844,8 @@ async function reconcilePersistedDockerEngine(): Promise<boolean> {
     process.exit(1);
   }
   await startWorkerForEngineState();
-  if (!(await waitForAgentmemoryReady(15000))) {
-    p.log.error("agentmemory worker did not become ready within 15s.");
+  if (!(await waitForAgentmemoryReady(READY_TIMEOUT_MS))) {
+    p.log.error(`agentmemory worker did not become ready within ${READY_TIMEOUT_MS / 1000}s.`);
     process.exit(1);
   }
   const consoleState = await ensureIiiConsole();
@@ -2007,7 +2016,7 @@ async function main() {
   if (skipEngine) {
     if (IS_VERBOSE) p.log.info("Skipping engine check (--no-engine)");
     await import("./index.js");
-    if (await waitForAgentmemoryReady(15000)) {
+    if (await waitForAgentmemoryReady(READY_TIMEOUT_MS)) {
       const consoleState = await ensureIiiConsole();
       await maybeOfferGlobalInstall();
       printReadyHint(consoleState);
@@ -2044,8 +2053,8 @@ async function main() {
     if (detected === IIPINNED_VERSION) {
       adoptRunningEngine();
       await startWorkerForEngineState();
-      if (!(await waitForAgentmemoryReady(15000))) {
-        p.log.error("agentmemory worker did not become ready within 15s.");
+      if (!(await waitForAgentmemoryReady(READY_TIMEOUT_MS))) {
+        p.log.error(`agentmemory worker did not become ready within ${READY_TIMEOUT_MS / 1000}s.`);
         process.exit(1);
       }
       const consoleState = await ensureIiiConsole();
@@ -2107,10 +2116,10 @@ async function main() {
   const s = p.spinner();
   s.start("Waiting for iii-engine to be ready...");
 
-  const ready = await waitForEngine(15000);
+  const ready = await waitForEngine(READY_TIMEOUT_MS);
   if (!ready) {
     const port = getRestPort();
-    s.stop("iii-engine did not become ready within 15s");
+    s.stop(`iii-engine did not become ready within ${READY_TIMEOUT_MS / 1000}s`);
     printDockerStartupLogs();
 
     if (startupFailure?.kind === "engine-crashed" || startupFailure?.kind === "docker-crashed") {
@@ -2156,8 +2165,8 @@ async function main() {
 
   s.stop(c.ok("iii-engine is ready"));
   await startWorkerForEngineState();
-  if (!(await waitForAgentmemoryReady(15000))) {
-    p.log.error("agentmemory worker did not become ready within 15s.");
+  if (!(await waitForAgentmemoryReady(READY_TIMEOUT_MS))) {
+    p.log.error(`agentmemory worker did not become ready within ${READY_TIMEOUT_MS / 1000}s.`);
     process.exit(1);
   }
   const consoleState = await ensureIiiConsole();
@@ -2473,10 +2482,12 @@ function buildDoctorEffects(): DoctorEffects {
       try {
         const started = await startEngine();
         if (!started) return { ok: false, message: "startEngine() returned false" };
-        const ready = await waitForEngine(15000);
+        const ready = await waitForEngine(READY_TIMEOUT_MS);
         return {
           ok: ready,
-          message: ready ? "Engine ready" : "Engine did not become ready within 15s",
+          message: ready
+            ? "Engine ready"
+            : `Engine did not become ready within ${READY_TIMEOUT_MS / 1000}s`,
         };
       } catch (err) {
         return {
@@ -2989,17 +3000,19 @@ async function startServerForDemo(): Promise<() => Promise<void>> {
       p.note(installInstructions().join("\n"), "Setup required");
       process.exit(1);
     }
-    if (!(await waitForEngine(15000))) {
+    if (!(await waitForEngine(READY_TIMEOUT_MS))) {
       printCapturedStartupStderr();
       printDockerStartupLogs();
-      p.log.error("iii-engine did not become ready within 15s.");
+      p.log.error(
+        `iii-engine did not become ready within ${READY_TIMEOUT_MS / 1000}s.`,
+      );
       process.exit(1);
     }
   }
 
   await startWorkerForEngineState();
-  if (!(await waitForAgentmemoryReady(15000))) {
-    p.log.error("agentmemory worker did not become ready within 15s.");
+  if (!(await waitForAgentmemoryReady(READY_TIMEOUT_MS))) {
+    p.log.error(`agentmemory worker did not become ready within ${READY_TIMEOUT_MS / 1000}s.`);
     process.exit(1);
   }
 

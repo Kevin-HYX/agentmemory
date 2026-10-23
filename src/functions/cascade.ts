@@ -3,6 +3,12 @@ import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import type { Memory, GraphNode, GraphEdge } from "../types.js";
 import { recordAudit } from "./audit.js";
+import {
+  hydrateEdgesObs,
+  hydrateNodesObs,
+  stripEdgeObs,
+  stripNodeObs,
+} from "../state/graph-provenance.js";
 
 export function registerCascadeFunction(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction("mem::cascade-update", 
@@ -24,14 +30,17 @@ export function registerCascadeFunction(sdk: ISdk, kv: StateKV): void {
 
       if (obsIds.size > 0) {
         const now = new Date().toISOString();
-        const nodes = await kv.list<GraphNode>(KV.graphNodes);
+        const nodes = await hydrateNodesObs(
+          kv,
+          await kv.list<GraphNode>(KV.graphNodes),
+        );
         for (const node of nodes) {
           if (node.stale) continue;
           const overlap = (node.sourceObservationIds ?? []).some((id) => obsIds.has(id));
           if (overlap) {
             node.stale = true;
             node.updatedAt = now;
-            await kv.set(KV.graphNodes, node.id, node);
+            await kv.set(KV.graphNodes, node.id, stripNodeObs(node));
             await recordAudit(kv, "consolidate", "mem::cascade-update", [node.id], {
               resourceType: "GraphNode",
               change: "marked stale from superseded memory",
@@ -41,13 +50,18 @@ export function registerCascadeFunction(sdk: ISdk, kv: StateKV): void {
           }
         }
 
-        const edges = await kv.list<GraphEdge>(KV.graphEdges);
+        // 来源数组在这里必须补回来才能做重叠判定 —— 它对热行恒为空，
+        // 不 hydrate 的话这个循环会静默地一条都不标记（级联失效失效）。
+        const edges = await hydrateEdgesObs(
+          kv,
+          await kv.list<GraphEdge>(KV.graphEdges),
+        );
         for (const edge of edges) {
           if (edge.stale) continue;
           const overlap = (edge.sourceObservationIds ?? []).some((id) => obsIds.has(id));
           if (overlap) {
             edge.stale = true;
-            await kv.set(KV.graphEdges, edge.id, edge);
+            await kv.set(KV.graphEdges, edge.id, stripEdgeObs(edge));
             await recordAudit(kv, "consolidate", "mem::cascade-update", [edge.id], {
               resourceType: "GraphEdge",
               change: "marked stale from superseded memory",

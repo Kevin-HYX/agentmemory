@@ -1,0 +1,63 @@
+[
+  {
+    "path": "search",
+    "query": "AgentMemory",
+    "ms": 3011,
+    "status": 200,
+    "resultCount": 3,
+    "ids": [
+      "obs_mtzfp9nd_d05fd6fbae42",
+      "obs_mt5zru8i_fd6cee245114",
+      "obs_mtvd93w4_4eb213ea6bef"
+    ]
+  },
+  {
+    "path": "search",
+    "query": "AgentMemory",
+    "ms": 2729,
+    "status": 200,
+    "resultCount": 3,
+    "ids": [
+      "obs_mtzfp9nd_d05fd6fbae42",
+      "obs_mt5zru8i_fd6cee245114",
+      "obs_mtvd93w4_4eb213ea6bef"
+    ]
+  },
+  {
+    "path": "search",
+    "query": "STA4003",
+    "ms": 2861,
+    "status": 200,
+    "resultCount": 3,
+    "ids": [
+      "obs_mu2tdldm_35c19989ca1c",
+      "obs_mu0ktez1_297aa9ac998b",
+      "obs_mu0o67hc_5d9a1f4074e6"
+    ]
+  },
+  {
+    "path": "search",
+    "query": "数学知识管理体系",
+    "ms": 1391,
+    "status": 200,
+    "resultCount": 3,
+    "ids": [
+      "obs_mv3g0k3z_d73b7562d2c6",
+      "obs_mu2bo28j_5eb0a7160c9f",
+      "obs_mu501kcv_34dc9d3a22cc"
+    ]
+  },
+  {
+    "path": "smart-search",
+    "query": "AgentMemory",
+    "ms": 2583,
+    "status": 200,
+    "resultCount": 3,
+    "mode": "compact",
+    "ids": [
+      "obs_mtzfp9nd_d05fd6fbae42",
+      "obs_mt5zru8i_fd6cee245114",
+      "obs_mtvd93w4_4eb213ea6bef"
+    ]
+  }
+]

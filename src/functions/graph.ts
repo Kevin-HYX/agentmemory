@@ -16,6 +16,19 @@ import {
 import { isGraphExtractionEnabled } from "../config.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import {
+  OBS_INDEX_CAP,
+  hydrateEdgesObs,
+  hydrateNodesObs,
+  indexObsToNodes,
+  readEdgeObsMap,
+  readNodeObsMap,
+  stripEdgeObs,
+  stripNodeObs,
+  unionObs,
+  writeEdgeObsMany,
+  writeNodeObsMany,
+} from "../state/graph-provenance.js";
 
 // #753: keep the response payload below the iii state channel ceiling.
 // 500 nodes + their incident edges hold well under the limit on the
@@ -207,6 +220,9 @@ async function applyDegreeDelta(
   snap: GraphSnapshot,
   nodeId: string,
   delta: number,
+  // 批次内新建/合并的行还没落盘，优先从这个回调取（否则晋升 topNodes 时会
+  // 读不到本批次刚建立的节点，与逐行写入的旧行为不一致）。
+  lookup?: (nodeId: string) => GraphNode | undefined,
 ): Promise<number> {
   const prev = (await kv.get<number>(KV.graphNodeDegree, nodeId)) ?? 0;
   const next = Math.max(0, prev + delta);
@@ -225,11 +241,17 @@ async function applyDegreeDelta(
     return next;
   }
 
+  const load = async (): Promise<GraphNode | null> =>
+    lookup?.(nodeId) ?? (await kv.get<GraphNode>(KV.graphNodes, nodeId));
+
   if (snap.topNodes.length < SNAPSHOT_TOP_NODES) {
     // Capacity available — fetch + promote.
-    const node = await kv.get<GraphNode>(KV.graphNodes, nodeId);
+    const node = await load();
     if (node && !node.stale) {
-      snap.topNodes.push(node);
+      // 快照会随每次写入落盘，来源数组在这里就已经没有价值了 —— 而且它正是
+      // 把 snapshot.bin 撑到 16.7MB 的原因。落快照前统一剥掉。
+      const row = stripNodeObs(node);
+      snap.topNodes.push(row);
       snap.topDegrees[node.id] = next;
       snap.topNodes.sort(
         (a, b) =>
@@ -244,11 +266,12 @@ async function applyDegreeDelta(
   if (!tailEntry) return next;
   const tailDegree = snap.topDegrees[tailEntry.id] ?? 0;
   if (next > tailDegree) {
-    const node = await kv.get<GraphNode>(KV.graphNodes, nodeId);
+    const node = await load();
     if (node && !node.stale) {
+      const row = stripNodeObs(node);
       const evicted = snap.topNodes.pop();
       if (evicted) delete snap.topDegrees[evicted.id];
-      snap.topNodes.push(node);
+      snap.topNodes.push(row);
       snap.topDegrees[node.id] = next;
       snap.topNodes.sort(
         (a, b) =>
@@ -272,36 +295,26 @@ function snapshotPushEdgeIfBothInTop(
   }
 }
 
+// 合并两个节点行。来源数组不在这里合并 —— 它已经外置到 mem:graph:node-obs，
+// 由 persistGraphDelta 统一按 unionObs 累加后批量写回。这里只负责行内字段。
 function mergeNode(
   existing: GraphNode,
   incoming: GraphNode,
-  obsIds: string[],
   capturedAt: string,
 ): GraphNode {
   return {
     ...existing,
-    sourceObservationIds: [
-      ...new Set([
-        ...existing.sourceObservationIds,
-        ...incoming.sourceObservationIds,
-        ...obsIds,
-      ]),
-    ],
     properties: { ...existing.properties, ...incoming.properties },
     updatedAt: capturedAt,
   };
 }
 
+// 同上：来源数组的合并走旁路记录。
 function mergeEdge(
   existing: GraphEdge,
-  obsIds: string[],
+  _obsIds: string[],
 ): GraphEdge {
-  return {
-    ...existing,
-    sourceObservationIds: [
-      ...new Set([...existing.sourceObservationIds, ...obsIds]),
-    ],
-  };
+  return { ...existing };
 }
 
 function resolvePagination(
@@ -358,6 +371,24 @@ function paginate(
     limit,
     offset,
   };
+}
+
+// 图谱查询结果的来源数组补全。
+//
+// 热行里的 sourceObservationIds 恒为空（真值在 mem:graph:node-obs /
+// edge-obs），而 GraphQueryResult 是外部 API 的响应形状，调用方（图谱面板、
+// MCP 资源、直接打 REST 的脚本）仍然期望看到来源链。这里只对「即将返回的
+// 这一页」补全 —— 分页之后才 hydrate，成本与 limit 成正比，与图谱规模无关。
+async function hydrateGraphQueryResult(
+  kv: StateKV,
+  result: GraphQueryResult,
+): Promise<GraphQueryResult> {
+  if (result.nodes.length === 0 && result.edges.length === 0) return result;
+  const [nodes, edges] = await Promise.all([
+    hydrateNodesObs(kv, result.nodes),
+    hydrateEdgesObs(kv, result.edges),
+  ]);
+  return { ...result, nodes, edges };
 }
 
 // Parse all key="value" pairs from a tag's attribute string, in any
@@ -537,6 +568,61 @@ export function extractGraphHeuristics(
   return { nodes, edges };
 }
 
+// ---------------------------------------------------------------------------
+// 有界「最早 K 个」收集器
+// ---------------------------------------------------------------------------
+// 回填 obs 反向索引时用来挑每个 obsId 最早的 OBS_INDEX_CAP 个节点。
+//
+// 之所以不用「全量收齐再排序」：实测每个 obsId 平均挂在 1198 个节点上，
+// 4024 个 obsId 就是 482 万个 (obsId, nodeId) 对，全量攒在内存里约 290MB ——
+// 而这个作业存在的意义恰恰是省内存。
+//
+// 之所以不用堆：满员之后绝大多数候选都该被直接拒绝，用「缓存当前最大值 +
+// 一次字符串比较」就能挡掉。只有新候选确实更早时才回扫一次定位并替换，
+// 随机顺序下回扫次数约为 K·ln(N/K)（K=64, N≈1200 时约 190 次/obsId），
+// 相对 482 万次插入可以忽略。
+class EarliestNodes {
+  private readonly candidates: Array<{ id: string; at: string }> = [];
+  private maxIndex = -1;
+
+  constructor(private readonly limit: number) {}
+
+  // 排序键：createdAt 升序，同一时刻按 nodeId 升序 —— 保证结果确定，
+  // 重复回填得到同一份索引。
+  private isLater(a: { id: string; at: string }, b: { id: string; at: string }): boolean {
+    if (a.at !== b.at) return a.at > b.at;
+    return a.id > b.id;
+  }
+
+  private recomputeMax(): void {
+    let maxIndex = 0;
+    for (let i = 1; i < this.candidates.length; i++) {
+      if (this.isLater(this.candidates[i]!, this.candidates[maxIndex]!)) {
+        maxIndex = i;
+      }
+    }
+    this.maxIndex = maxIndex;
+  }
+
+  add(id: string, at: string): void {
+    if (this.candidates.length < this.limit) {
+      this.candidates.push({ id, at });
+      if (this.candidates.length === this.limit) this.recomputeMax();
+      return;
+    }
+    // 常见路径：候选不比当前最晚的一条更早，直接丢弃。
+    if (!this.isLater({ id, at }, this.candidates[this.maxIndex]!)) return;
+    this.candidates[this.maxIndex] = { id, at };
+    this.recomputeMax();
+  }
+
+  ids(): string[] {
+    return [...this.candidates]
+      .sort((a, b) => (this.isLater(a, b) ? -1 : this.isLater(b, a) ? 1 : 0))
+      .map((c) => c.id);
+  }
+}
+
 // Shared persistence for a batch of extracted/imported nodes and edges.
 // Factored out of mem::graph-extract so structural importers (graphify)
 // reuse the exact same name-index upsert, degree bookkeeping, and snapshot
@@ -548,6 +634,11 @@ export function extractGraphHeuristics(
 // `kv.list<GraphNode>(KV.graphNodes)`. At 75K nodes the list payload
 // exceeds the iii heartbeat budget and the worker dies before merge can
 // complete. Each name-index entry is a single small kv.get/set pair.
+//
+// 来源数组外置之后（见 state/schema.ts），这个函数还承担了第二项职责：
+// 把本批次产生的 obsId 累加进 mem:graph:node-obs / edge-obs 旁路记录，并
+// 维护 obs 反向索引。为了让批量导入不至于退化成「每行两次 RPC」，解析阶段
+// 全部走 getMany 批量读，写入阶段全部走 setMany 批量写。
 export async function persistGraphDelta(
   kv: StateKV,
   nodes: GraphNode[],
@@ -568,106 +659,271 @@ export async function persistGraphDelta(
   // same edge-index key instead of duplicating.
   const idRemap = new Map<string, string>();
 
+  // -------------------------------------------------------------------------
+  // 节点：批量解析 → 内存合并 → 批量写回
+  // -------------------------------------------------------------------------
+  // 批次内可能出现同 (type,name) 的多个节点：原实现是顺序写、后一个通过名字
+  // 索引读到前一个刚写入的行再合并。批量化的代价是「读」发生在全部「写」
+  // 之前，所以要自己维护三张表把这件事还原回来：
+  //   rowById      当前行内容（含批次内已发生的合并）
+  //   freshByIndex 本批次新建的 indexKey -> nodeId
+  //   obsById      累积的来源数组
+  const nodeIndexKeys = nodes.map((n) => nameIndexKey(n.type, n.name));
+  const nodeIdByIndexKey = await kv.getMany<string>(
+    KV.graphNameIndex,
+    nodeIndexKeys,
+  );
+  const candidateNodeIds = [...new Set(nodeIdByIndexKey.values())];
+  const nodeRowsFromStore = await kv.getMany<GraphNode>(
+    KV.graphNodes,
+    candidateNodeIds,
+  );
+
+  const rowById = new Map<string, GraphNode>();
+  const resolvedByIndexKey = new Map<string, GraphNode>();
+  for (const [indexKey, nodeId] of nodeIdByIndexKey) {
+    const row = nodeRowsFromStore.get(nodeId);
+    if (!row) continue;
+    // #825 follow-up: name-index lookups can resolve into pre-reset rows.
+    // Drop them so extract writes a fresh node + index entry instead of
+    // silently reconnecting to a legacy orphan (which would keep the
+    // snapshot at 0 forever after a reset).
+    if (
+      snap.resetAt &&
+      typeof row.createdAt === "string" &&
+      row.createdAt < snap.resetAt
+    ) {
+      continue;
+    }
+    rowById.set(row.id, row);
+    resolvedByIndexKey.set(indexKey, row);
+  }
+
+  const obsById = await readNodeObsMap(kv, [...rowById.values()]);
+  const freshNodeIdByIndexKey = new Map<string, string>();
+  const pendingNameIndexWrites: Array<readonly [string, string]> = [];
+  const pendingDegreeWrites: Array<readonly [string, number]> = [];
+  const touchedNodeIds: string[] = [];
+  const seenTouchedNodeIds = new Set<string>();
+
+  const accumulateNodeObs = (nodeId: string, incoming: readonly string[]): void => {
+    obsById.set(nodeId, unionObs(obsById.get(nodeId), incoming, obsIds));
+  };
+  const markTouched = (nodeId: string): void => {
+    if (seenTouchedNodeIds.has(nodeId)) return;
+    seenTouchedNodeIds.add(nodeId);
+    touchedNodeIds.push(nodeId);
+  };
+
   for (const node of nodes) {
     const indexKey = nameIndexKey(node.type, node.name);
-    const existingId = await kv.get<string>(KV.graphNameIndex, indexKey);
-
-    let existing: GraphNode | null = null;
-    if (existingId) {
-      existing = await kv.get<GraphNode>(KV.graphNodes, existingId);
-      // #825 follow-up: name-index lookups can resolve into
-      // pre-reset rows. Drop them so extract writes a fresh
-      // node + index entry instead of silently reconnecting
-      // to a legacy orphan (which would keep the snapshot at
-      // 0 forever after a reset).
-      if (
-        existing &&
-        snap.resetAt &&
-        typeof existing.createdAt === "string" &&
-        existing.createdAt < snap.resetAt
-      ) {
-        existing = null;
-      }
-    }
+    const existing = resolvedByIndexKey.get(indexKey);
 
     if (existing) {
       idRemap.set(node.id, existing.id);
-      const merged = mergeNode(existing, node, obsIds, capturedAt);
-      await kv.set(KV.graphNodes, existing.id, merged);
-      // Update topNodes entry if present so a stale clone isn't
-      // returned from the snapshot fast path.
-      const topIdx = snap.topNodes.findIndex((n) => n.id === existing!.id);
+      const base = rowById.get(existing.id) ?? existing;
+      const merged = stripNodeObs(mergeNode(base, node, capturedAt));
+      rowById.set(existing.id, merged);
+      accumulateNodeObs(existing.id, node.sourceObservationIds ?? []);
+      markTouched(existing.id);
+      // Update topNodes entry if present so a stale clone isn't returned
+      // from the snapshot fast path.
+      const topIdx = snap.topNodes.findIndex((n) => n.id === existing.id);
       if (topIdx !== -1) {
         snap.topNodes[topIdx] = merged;
         snapMutated = true;
       }
-    } else {
-      await kv.set(KV.graphNodes, node.id, node);
-      await kv.set(KV.graphNameIndex, indexKey, node.id);
-      await kv.set(KV.graphNodeDegree, node.id, 0);
-      snap.stats.totalNodes += 1;
-      snap.stats.nodesByType[node.type] =
-        (snap.stats.nodesByType[node.type] ?? 0) + 1;
-      newNodeCount += 1;
-      if (snap.topNodes.length < SNAPSHOT_TOP_NODES) {
-        // Degree 0 still beats an empty slot — sit at the tail
-        // until edges arrive and promote.
-        snap.topNodes.push(node);
-        snap.topDegrees[node.id] = 0;
+      continue;
+    }
+
+    const pendingId = freshNodeIdByIndexKey.get(indexKey);
+    if (pendingId) {
+      // 同批次内的重名节点：合并进本批次刚建的那一行。
+      idRemap.set(node.id, pendingId);
+      const base = rowById.get(pendingId)!;
+      const merged = stripNodeObs(mergeNode(base, node, capturedAt));
+      rowById.set(pendingId, merged);
+      accumulateNodeObs(pendingId, node.sourceObservationIds ?? []);
+      const topIdx = snap.topNodes.findIndex((n) => n.id === pendingId);
+      if (topIdx !== -1) {
+        snap.topNodes[topIdx] = merged;
+        snapMutated = true;
       }
+      continue;
+    }
+
+    const fresh = stripNodeObs(node);
+    rowById.set(node.id, fresh);
+    freshNodeIdByIndexKey.set(indexKey, node.id);
+    pendingNameIndexWrites.push([indexKey, node.id]);
+    pendingDegreeWrites.push([node.id, 0]);
+    accumulateNodeObs(node.id, node.sourceObservationIds ?? []);
+    markTouched(node.id);
+    snap.stats.totalNodes += 1;
+    snap.stats.nodesByType[node.type] =
+      (snap.stats.nodesByType[node.type] ?? 0) + 1;
+    newNodeCount += 1;
+    if (snap.topNodes.length < SNAPSHOT_TOP_NODES) {
+      // Degree 0 still beats an empty slot — sit at the tail until edges
+      // arrive and promote.
+      snap.topNodes.push(fresh);
+      snap.topDegrees[node.id] = 0;
     }
   }
 
-  for (const rawEdge of edges) {
-    const edge: GraphEdge = {
-      ...rawEdge,
-      sourceNodeId: idRemap.get(rawEdge.sourceNodeId) ?? rawEdge.sourceNodeId,
-      targetNodeId: idRemap.get(rawEdge.targetNodeId) ?? rawEdge.targetNodeId,
-    };
-    const eKey = edgeIndexKey(edge.sourceNodeId, edge.targetNodeId, edge.type);
-    const existingId = await kv.get<string>(KV.graphEdgeKey, eKey);
+  // -------------------------------------------------------------------------
+  // 边：同样的批量解析 → 合并 → 写回
+  // -------------------------------------------------------------------------
+  const remappedEdges: GraphEdge[] = edges.map((raw) => ({
+    ...raw,
+    sourceNodeId: idRemap.get(raw.sourceNodeId) ?? raw.sourceNodeId,
+    targetNodeId: idRemap.get(raw.targetNodeId) ?? raw.targetNodeId,
+  }));
+  const edgeIndexKeys = remappedEdges.map((e) =>
+    edgeIndexKey(e.sourceNodeId, e.targetNodeId, e.type),
+  );
+  const edgeIdByIndexKey = await kv.getMany<string>(
+    KV.graphEdgeKey,
+    edgeIndexKeys,
+  );
+  const edgeRowsFromStore = await kv.getMany<GraphEdge>(
+    KV.graphEdges,
+    [...new Set(edgeIdByIndexKey.values())],
+  );
 
-    let existing: GraphEdge | null = null;
-    if (existingId) {
-      existing = await kv.get<GraphEdge>(KV.graphEdges, existingId);
-      // Same #825 orphan check as the node path above.
-      if (
-        existing &&
-        snap.resetAt &&
-        typeof existing.createdAt === "string" &&
-        existing.createdAt < snap.resetAt
-      ) {
-        existing = null;
-      }
+  const edgeRowById = new Map<string, GraphEdge>();
+  const resolvedEdgeByIndexKey = new Map<string, GraphEdge>();
+  for (const [indexKey, edgeId] of edgeIdByIndexKey) {
+    const row = edgeRowsFromStore.get(edgeId);
+    if (!row) continue;
+    // Same #825 orphan check as the node path above.
+    if (
+      snap.resetAt &&
+      typeof row.createdAt === "string" &&
+      row.createdAt < snap.resetAt
+    ) {
+      continue;
     }
+    edgeRowById.set(row.id, row);
+    resolvedEdgeByIndexKey.set(indexKey, row);
+  }
+
+  const edgeObsById = await readEdgeObsMap(kv, [...edgeRowById.values()]);
+  const freshEdgeIdByIndexKey = new Map<string, string>();
+  const pendingEdgeIndexWrites: Array<readonly [string, string]> = [];
+  const touchedEdgeIds: string[] = [];
+  const seenTouchedEdgeIds = new Set<string>();
+
+  const accumulateEdgeObs = (edgeId: string): void => {
+    edgeObsById.set(edgeId, unionObs(edgeObsById.get(edgeId), obsIds));
+  };
+  const markEdgeTouched = (edgeId: string): void => {
+    if (seenTouchedEdgeIds.has(edgeId)) return;
+    seenTouchedEdgeIds.add(edgeId);
+    touchedEdgeIds.push(edgeId);
+  };
+
+  for (let i = 0; i < remappedEdges.length; i++) {
+    const edge = remappedEdges[i]!;
+    const eKey = edgeIndexKeys[i]!;
+    const existing = resolvedEdgeByIndexKey.get(eKey);
 
     if (existing) {
-      const merged = mergeEdge(existing, obsIds);
-      await kv.set(KV.graphEdges, existing.id, merged);
+      const base = edgeRowById.get(existing.id) ?? existing;
+      const merged = stripEdgeObs(mergeEdge(base, obsIds));
+      edgeRowById.set(existing.id, merged);
+      accumulateEdgeObs(existing.id);
+      markEdgeTouched(existing.id);
       // Replace cached topEdges entry too if present.
-      const topIdx = snap.topEdges.findIndex((e) => e.id === existing!.id);
+      const topIdx = snap.topEdges.findIndex((e) => e.id === existing.id);
       if (topIdx !== -1) {
         snap.topEdges[topIdx] = merged;
         snapMutated = true;
       }
-    } else {
-      await kv.set(KV.graphEdges, edge.id, edge);
-      await kv.set(KV.graphEdgeKey, eKey, edge.id);
-      snap.stats.totalEdges += 1;
-      snap.stats.edgesByType[edge.type] =
-        (snap.stats.edgesByType[edge.type] ?? 0) + 1;
-      newEdgeCount += 1;
-      await applyDegreeDelta(kv, snap, edge.sourceNodeId, +1);
-      await applyDegreeDelta(kv, snap, edge.targetNodeId, +1);
-      newEdgesForTopCheck.push(edge);
+      continue;
     }
+
+    const pendingId = freshEdgeIdByIndexKey.get(eKey);
+    if (pendingId) {
+      const base = edgeRowById.get(pendingId)!;
+      const merged = stripEdgeObs(mergeEdge(base, obsIds));
+      edgeRowById.set(pendingId, merged);
+      accumulateEdgeObs(pendingId);
+      const topIdx = snap.topEdges.findIndex((e) => e.id === pendingId);
+      if (topIdx !== -1) {
+        snap.topEdges[topIdx] = merged;
+        snapMutated = true;
+      }
+      continue;
+    }
+
+    const fresh = stripEdgeObs(edge);
+    edgeRowById.set(edge.id, fresh);
+    freshEdgeIdByIndexKey.set(eKey, edge.id);
+    pendingEdgeIndexWrites.push([eKey, edge.id]);
+    accumulateEdgeObs(edge.id);
+    markEdgeTouched(edge.id);
+    snap.stats.totalEdges += 1;
+    snap.stats.edgesByType[edge.type] =
+      (snap.stats.edgesByType[edge.type] ?? 0) + 1;
+    newEdgeCount += 1;
+    await applyDegreeDelta(kv, snap, edge.sourceNodeId, +1, (id) =>
+      rowById.get(id),
+    );
+    await applyDegreeDelta(kv, snap, edge.targetNodeId, +1, (id) =>
+      rowById.get(id),
+    );
+    newEdgesForTopCheck.push(fresh);
   }
 
-  // Push newly-added edges into snapshot.topEdges if both
-  // endpoints are in the top-N (post-degree-delta). Done after
-  // all degree updates so the topIds set is stable.
+  // Push newly-added edges into snapshot.topEdges if both endpoints are in
+  // the top-N (post-degree-delta). Done after all degree updates so the
+  // topIds set is stable.
   for (const edge of newEdgesForTopCheck) {
     snapshotPushEdgeIfBothInTop(snap, edge);
+  }
+
+  // -------------------------------------------------------------------------
+  // 落盘。顺序是有意为之：来源数组必须早于热行写入。
+  // -------------------------------------------------------------------------
+  // 热行里 sourceObservationIds 恒为空，真值只在旁路记录里。如果先写热行、
+  // 中途失败，这一批的来源数据就永久丢了。反过来先写旁路、后写热行，最坏
+  // 情况只是旁路记录里多了一批「热行尚未置空」的数据，重跑即可自愈。
+  if (touchedNodeIds.length > 0) {
+    await writeNodeObsMany(
+      kv,
+      touchedNodeIds.map((id) => [id, obsById.get(id) ?? []] as const),
+    );
+  }
+  if (touchedEdgeIds.length > 0) {
+    await writeEdgeObsMany(
+      kv,
+      touchedEdgeIds.map((id) => [id, edgeObsById.get(id) ?? []] as const),
+    );
+  }
+  if (touchedNodeIds.length > 0 && obsIds.length > 0) {
+    await indexObsToNodes(kv, touchedNodeIds, obsIds);
+  }
+  if (touchedNodeIds.length > 0) {
+    await kv.setMany(
+      KV.graphNodes,
+      touchedNodeIds.map((id) => [id, rowById.get(id)!] as const),
+    );
+  }
+  if (touchedEdgeIds.length > 0) {
+    await kv.setMany(
+      KV.graphEdges,
+      touchedEdgeIds.map((id) => [id, edgeRowById.get(id)!] as const),
+    );
+  }
+  if (pendingNameIndexWrites.length > 0) {
+    await kv.setMany(KV.graphNameIndex, pendingNameIndexWrites);
+  }
+  if (pendingDegreeWrites.length > 0) {
+    await kv.setMany(KV.graphNodeDegree, pendingDegreeWrites);
+  }
+  if (pendingEdgeIndexWrites.length > 0) {
+    await kv.setMany(KV.graphEdgeKey, pendingEdgeIndexWrites);
   }
 
   if (newNodeCount > 0 || newEdgeCount > 0 || snapMutated) {
@@ -819,10 +1075,18 @@ export function registerGraphFunction(
         };
       }
 
-      // Query / startNodeId paths still need broader access. Race the
-      // live enumeration against a wall-clock budget so a long
-      // kv.list doesn't block the worker indefinitely. On timeout the
-      // caller gets a snapshot-backed approximation instead of a 500.
+      // Query / startNodeId paths still need broader access, so they list
+      // the node/edge scopes. That path used to be the dangerous one: at
+      // 18.6K nodes / 33.2K edges the two payloads were 132.8MB + 230MB of
+      // JSON, and parsing them starved the iii heartbeat (~0.35s) long
+      // before any Promise.race timer could fire — the caller saw
+      // "Invocation stopped" and the worker was restarted.
+      //
+      // Since the provenance arrays moved out of the hot rows (see
+      // state/schema.ts) the same two scopes hold 4.0MB + 7.7MB, so a plain
+      // enumeration is cheap. The wall-clock race stays as a regression
+      // guard: if a future change re-inflates the rows, callers still get a
+      // snapshot-backed answer instead of a 500.
       let allNodes: GraphNode[];
       let allEdges: GraphEdge[];
       try {
@@ -846,10 +1110,11 @@ export function registerGraphFunction(
           return {
             ...paginateFromSnapshot(snap, data.nodeType, limit, offset),
             warning:
-              "Live graph enumeration exceeded budget. Query / " +
-              "startNodeId paths degrade on >25K-node corpora until a " +
-              "per-node edge index lands. Result reflects top-degree " +
-              "snapshot, not the requested walk.",
+              "Live graph enumeration exceeded its budget; the result " +
+              "reflects the top-degree snapshot rather than the requested " +
+              "walk. This points at an over-sized node/edge row — check " +
+              "that sourceObservationIds is not being written back into " +
+              "mem:graph:nodes / mem:graph:edges.",
           };
         }
         return {
@@ -875,10 +1140,31 @@ export function registerGraphFunction(
               (v) => typeof v === "string" && v.toLowerCase().includes(lower),
             ),
         );
-        return paginate(matchingNodes, allEdges, 0, limit, offset);
+        return hydrateGraphQueryResult(
+          kv,
+          paginate(matchingNodes, allEdges, 0, limit, offset),
+        );
       }
 
       if (data.startNodeId) {
+        // 邻接表在遍历前一次性建好。
+        //
+        // 原实现对每个访问到的节点都跑一遍 allEdges.filter，整体是 O(V×E)：
+        // 500 个节点 × 33K 条边 = 1650 万次比较，而且 allNodes.find 同样是
+        // 每个节点一次线性扫描。建表之后是 O(E) + O(Σdeg)，稀疏图上快了一到
+        // 两个数量级 —— 这部分是纯 CPU，但同样占用事件循环，会挤压心跳预算。
+        const nodeById = new Map<string, GraphNode>();
+        for (const node of allNodes) nodeById.set(node.id, node);
+        const adjacency = new Map<string, GraphEdge[]>();
+        for (const edge of allEdges) {
+          const source = adjacency.get(edge.sourceNodeId);
+          if (source) source.push(edge);
+          else adjacency.set(edge.sourceNodeId, [edge]);
+          const target = adjacency.get(edge.targetNodeId);
+          if (target) target.push(edge);
+          else adjacency.set(edge.targetNodeId, [edge]);
+        }
+
         const visited = new Set<string>();
         const visitedEdges = new Set<string>();
         const resultNodes: GraphNode[] = [];
@@ -892,17 +1178,14 @@ export function registerGraphFunction(
           if (visited.has(nodeId) || depth > maxDepth) continue;
           visited.add(nodeId);
 
-          const node = allNodes.find((n) => n.id === nodeId);
+          const node = nodeById.get(nodeId);
           if (node) {
             if (!data.nodeType || node.type === data.nodeType) {
               resultNodes.push(node);
             }
           }
 
-          const neighborEdges = allEdges.filter(
-            (e) => e.sourceNodeId === nodeId || e.targetNodeId === nodeId,
-          );
-          for (const edge of neighborEdges) {
+          for (const edge of adjacency.get(nodeId) ?? []) {
             if (!visitedEdges.has(edge.id)) {
               visitedEdges.add(edge.id);
               resultEdges.push(edge);
@@ -917,11 +1200,17 @@ export function registerGraphFunction(
           }
         }
 
-        return paginate(resultNodes, resultEdges, maxDepth, limit, offset);
+        return hydrateGraphQueryResult(
+          kv,
+          paginate(resultNodes, resultEdges, maxDepth, limit, offset),
+        );
       }
 
       // Unreachable — noWalk branch handles the rest.
-      return paginate([], [], 0, limit, offset);
+      return hydrateGraphQueryResult(
+        kv,
+        paginate([], [], 0, limit, offset),
+      );
     },
   );
 
@@ -1100,6 +1389,145 @@ export function registerGraphFunction(
       return { success: false, error: msg };
     }
   });
+
+  // -------------------------------------------------------------------------
+  // mem::graph-provenance-backfill
+  // -------------------------------------------------------------------------
+  // 一次性维护作业：把存量数据的来源数组从热行搬到旁路 scope。
+  //
+  // 这次修复本身是向后兼容的（旁路缺失时读取回退到热行内旧值），所以存量
+  // 数据在新代码下能正常工作 —— 但热行依然是 132.8MB + 230MB，枚举照样会
+  // 打挂心跳。要真正吃到修复，存量语料必须跑一遍这个函数把来源数组搬走。
+  //
+  // 实现刻意走 kv.rewriteScope（按分片重写）而不是 kv.list + 逐行 set：
+  //   * 峰值内存只有一个分片几十 KB，而不是整个 scope；
+  //   * 每个分片只做一次读改写，避免「写 N 行 = 重写 N 次分片文件」的放大。
+  //
+  // 幂等：来源数组已经是空数组的行原样返回，重复执行只是空转一遍。
+  sdk.registerFunction("mem::graph-provenance-backfill",
+    async (data?: { skipObsIndex?: boolean }) => {
+      const started = Date.now();
+      const counters = {
+        nodesScanned: 0,
+        nodeObsWritten: 0,
+        edgesScanned: 0,
+        edgeObsWritten: 0,
+      };
+
+      // 反向索引的截断规则是「按 createdAt 取最早的 OBS_INDEX_CAP 个节点」，
+      // 而分片遍历顺序与时间无关，所以只能先把候选收齐、最后一次性定序写入。
+      const obsCandidates = new Map<string, EarliestNodes>();
+
+      const nodeStats = await kv.rewriteScope(
+        KV.graphNodes,
+        async (rows) => {
+          const obsEntries: Array<readonly [string, readonly string[]]> = [];
+          const next: Record<string, unknown> = {};
+          for (const [id, raw] of Object.entries(rows)) {
+            const node = raw as GraphNode;
+            const obs = node.sourceObservationIds ?? [];
+            if (obs.length > 0) {
+              obsEntries.push([id, obs]);
+              const at = typeof node.createdAt === "string" ? node.createdAt : "";
+              for (const obsId of obs) {
+                let bucket = obsCandidates.get(obsId);
+                if (!bucket) {
+                  bucket = new EarliestNodes(OBS_INDEX_CAP);
+                  obsCandidates.set(obsId, bucket);
+                }
+                bucket.add(id, at);
+              }
+            }
+            next[id] = obs.length > 0 ? stripNodeObs(node) : node;
+            counters.nodesScanned += 1;
+          }
+          // 先写旁路记录，再由 rewriteScope 写回热行 —— 顺序与在线写入一致，
+          // 中途失败也不会丢来源数据。
+          if (obsEntries.length > 0) {
+            await writeNodeObsMany(kv, obsEntries);
+            counters.nodeObsWritten += obsEntries.length;
+          }
+          return next;
+        },
+        { concurrency: 4 },
+      );
+
+      const edgeStats = await kv.rewriteScope(
+        KV.graphEdges,
+        async (rows) => {
+          const obsEntries: Array<readonly [string, readonly string[]]> = [];
+          const next: Record<string, unknown> = {};
+          for (const [id, raw] of Object.entries(rows)) {
+            const edge = raw as GraphEdge;
+            const obs = edge.sourceObservationIds ?? [];
+            if (obs.length > 0) obsEntries.push([id, obs]);
+            next[id] = obs.length > 0 ? stripEdgeObs(edge) : edge;
+            counters.edgesScanned += 1;
+          }
+          if (obsEntries.length > 0) {
+            await writeEdgeObsMany(kv, obsEntries);
+            counters.edgeObsWritten += obsEntries.length;
+          }
+          return next;
+        },
+        { concurrency: 4 },
+      );
+
+      let obsIndexEntries = 0;
+      if (!data?.skipObsIndex) {
+        const entries: Array<readonly [string, string[]]> = [];
+        for (const [obsId, bucket] of obsCandidates) {
+          const ids = bucket.ids();
+          if (ids.length > 0) entries.push([obsId, ids]);
+        }
+        if (entries.length > 0) await kv.setMany(KV.graphObsIndex, entries);
+        obsIndexEntries = entries.length;
+      }
+
+      // 快照里同样带着来源数组（snapshot.bin 实测 16.7MB），一并剥掉。
+      // 不处理的话 graph/query 的 no-walk 快路径仍然会把十几 MB 读进内存。
+      let snapshotStripped = 0;
+      const snap = await readSnapshot(kv);
+      if (snap) {
+        for (let i = 0; i < snap.topNodes.length; i++) {
+          const node = snap.topNodes[i]!;
+          if ((node.sourceObservationIds ?? []).length > 0) {
+            snap.topNodes[i] = stripNodeObs(node);
+            snapshotStripped += 1;
+          }
+        }
+        for (let i = 0; i < snap.topEdges.length; i++) {
+          const edge = snap.topEdges[i]!;
+          if ((edge.sourceObservationIds ?? []).length > 0) {
+            snap.topEdges[i] = stripEdgeObs(edge);
+            snapshotStripped += 1;
+          }
+        }
+        if (snapshotStripped > 0) {
+          await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
+        }
+      }
+
+      const tookMs = Date.now() - started;
+      logger.info("Graph provenance backfill complete", {
+        ...counters,
+        nodeShards: nodeStats.shards,
+        edgeShards: edgeStats.shards,
+        obsIndexEntries,
+        snapshotStripped,
+        tookMs,
+      });
+      return {
+        success: true,
+        ...counters,
+        nodeShards: nodeStats.shards,
+        edgeShards: edgeStats.shards,
+        obsIndexEntries,
+        snapshotStripped,
+        tookMs,
+      };
+    },
+  );
 
   // #814 v2 + #825: clean-restart escape hatch for corpora of any
   // size, including the legacy 75K+ case that crashes kv.list.

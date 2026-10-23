@@ -29,6 +29,10 @@ import { normalizeAccessLog } from "./access-tracker.js";
 import { KV } from "../state/schema.js";
 import { checkPayloadFrameSize } from "../state/frame-guard.js";
 import { StateKV } from "../state/kv.js";
+import {
+  hydrateEdgesObs,
+  hydrateNodesObs,
+} from "../state/graph-provenance.js";
 import { VERSION } from "../version.js";
 import { recordAudit } from "./audit.js";
 import { indexRecords } from "./search.js";
@@ -135,6 +139,17 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         kv.list<AccessLogExport>(KV.accessLog).catch(() => []),
       ]);
 
+      // 导出必须把来源数组补回去。
+      //
+      // 热行里的 sourceObservationIds 恒为空（真值在 mem:graph:node-obs /
+      // edge-obs），照原样导出会让「导出 → 导入」这一圈丢掉整张图谱的来源链，
+      // 而导入侧（temporal-graph 的合并逻辑）正是靠这个字段去重合并的。
+      // 导出是低频的管理操作，这里多花一次按行数的批量读取换取往返保真。
+      const [exportGraphNodes, exportGraphEdges] = await Promise.all([
+        hydrateNodesObs(kv, graphNodes),
+        hydrateEdgesObs(kv, graphEdges),
+      ]);
+
       const exportData: ExportData = {
         version: VERSION,
         exportedAt: new Date().toISOString(),
@@ -143,8 +158,8 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         memories,
         summaries,
         profiles: profiles.length > 0 ? profiles : undefined,
-        graphNodes: graphNodes.length > 0 ? graphNodes : undefined,
-        graphEdges: graphEdges.length > 0 ? graphEdges : undefined,
+        graphNodes: exportGraphNodes.length > 0 ? exportGraphNodes : undefined,
+        graphEdges: exportGraphEdges.length > 0 ? exportGraphEdges : undefined,
         semanticMemories:
           semanticMemories.length > 0 ? semanticMemories : undefined,
         proceduralMemories:

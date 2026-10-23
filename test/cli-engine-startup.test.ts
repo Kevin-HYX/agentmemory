@@ -30,17 +30,29 @@ describe("fresh native engine startup", () => {
     );
     expect(spawnBody).toContain("activeStartupStderr.append(chunk)");
 
-    const timeoutStart = source.indexOf("const ready = await waitForEngine(15000)");
+    // 就绪等待上限是可配置的（AGENTMEMORY_READY_TIMEOUT_MS，默认 15s）：
+    // 引擎冷启动要反序列化整个 state_store，集群规模下远超 15s，写死上限会让
+    // 启动必然失败。这里断言调用点统一走常量，且超时分支仍然打印缓冲的 stderr。
+    const timeoutStart = source.indexOf("const ready = await waitForEngine(READY_TIMEOUT_MS)");
     const timeoutEnd = source.indexOf('s.stop(c.ok("iii-engine is ready"))', timeoutStart);
     expect(source.slice(timeoutStart, timeoutEnd)).toContain(
       "printCapturedStartupStderr()",
     );
 
-    const demoTimeoutStart = source.indexOf("await waitForEngine(15000)", timeoutEnd);
+    const demoTimeoutStart = source.indexOf("await waitForEngine(READY_TIMEOUT_MS)", timeoutEnd);
     const demoTimeoutEnd = source.indexOf("await import(\"./index.js\")", demoTimeoutStart);
     expect(source.slice(demoTimeoutStart, demoTimeoutEnd)).toContain(
       "printCapturedStartupStderr()",
     );
+  });
+
+  it("keeps the engine readiness deadline overridable with a 15s default", () => {
+    expect(source).toContain('process.env["AGENTMEMORY_READY_TIMEOUT_MS"]');
+    expect(source).toContain("return Number.isFinite(n) && n > 0 ? n : 15_000;");
+    // 不允许再出现写死的 15s 就绪等待：那会让大 state_store 的实例必然启动失败。
+    expect(source).not.toContain("waitForEngine(15000)");
+    expect(source).not.toContain("waitForAgentmemoryReady(15000)");
+    expect(source).not.toContain("within 15s");
   });
 
   it("exports the complete derived port set for Docker and native launchers", () => {
@@ -92,7 +104,9 @@ describe("fresh native engine startup", () => {
     expect(workerBody).toContain('await import("./index.js")');
 
     expect(source.match(/await startWorkerForEngineState\(\)/g)).toHaveLength(4);
-    expect(source).toContain("agentmemory worker did not become ready within 15s");
+    expect(source).toContain(
+      "`agentmemory worker did not become ready within ${READY_TIMEOUT_MS / 1000}s.`",
+    );
   });
 
   it("stores lifecycle metadata per resolved instance and scopes Docker", () => {

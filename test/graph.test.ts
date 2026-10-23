@@ -30,6 +30,26 @@ function mockKV() {
       const entries = store.get(scope);
       return entries ? (Array.from(entries.values()) as T[]) : [];
     },
+    getMany: async <T>(
+      scope: string,
+      keys: readonly string[],
+    ): Promise<Map<string, T>> => {
+      const out = new Map<string, T>();
+      const rows = store.get(scope);
+      if (!rows) return out;
+      for (const key of keys) {
+        if (rows.has(key)) out.set(key, rows.get(key) as T);
+      }
+      return out;
+    },
+    setMany: async <T>(
+      scope: string,
+      pairs: ReadonlyArray<readonly [string, T]>,
+    ): Promise<void> => {
+      if (!store.has(scope)) store.set(scope, new Map());
+      const rows = store.get(scope)!;
+      for (const [key, value] of pairs) rows.set(key, value);
+    },
   };
 }
 

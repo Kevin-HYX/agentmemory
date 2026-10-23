@@ -10,6 +10,18 @@ import type {
 import { KV, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { logger } from "../logger.js";
+import {
+  hydrateEdgesObs,
+  hydrateNodesObs,
+  indexObsToNodes,
+  readEdgeObs,
+  readNodeObs,
+  stripEdgeObs,
+  stripNodeObs,
+  unionObs,
+  writeEdgeObs,
+  writeNodeObs,
+} from "../state/graph-provenance.js";
 
 const TEMPORAL_EXTRACTION_SYSTEM = `You are a temporal knowledge extraction engine. Given observations, extract entities AND their temporal relationships with full context metadata.
 
@@ -197,14 +209,15 @@ export function registerTemporalGraphFunctions(
           );
           if (existing) {
             const oldId = node.id;
+            // 来源数组已外置到 mem:graph:node-obs，合并前先取回旁路记录，
+            // 否则这次合并会把历史来源整条抹掉。
+            const mergedObs = unionObs(
+              await readNodeObs(kv, existing),
+              node.sourceObservationIds,
+              obsIds,
+            );
             const merged = {
-              ...existing,
-              sourceObservationIds: [
-                ...new Set([
-                  ...existing.sourceObservationIds,
-                  ...obsIds,
-                ]),
-              ],
+              ...stripNodeObs(existing),
               properties: { ...existing.properties, ...node.properties },
               updatedAt: new Date().toISOString(),
               aliases: [
@@ -215,11 +228,17 @@ export function registerTemporalGraphFunctions(
               ],
             };
             if (merged.aliases.length === 0) delete (merged as any).aliases;
+            await writeNodeObs(kv, existing.id, mergedObs);
             await kv.set(KV.graphNodes, existing.id, merged);
+            await indexObsToNodes(kv, [existing.id], obsIds);
             node.id = existing.id;
             idRemap.set(oldId, existing.id);
           } else {
-            await kv.set(KV.graphNodes, node.id, node);
+            await writeNodeObs(kv, node.id, unionObs(node.sourceObservationIds, obsIds));
+            await kv.set(KV.graphNodes, node.id, stripNodeObs(node));
+            await indexObsToNodes(kv, [node.id], obsIds);
+            // 保留未剥离的副本供同批次后续查重（它带着来源数组，但读取一律
+            // 先查旁路记录，所以这里保持一致即可）。
             existingNodes.push(node);
           }
         }
@@ -240,12 +259,13 @@ export function registerTemporalGraphFunctions(
 
           if (existingEdge) {
             const updatedOld = {
-              ...existingEdge,
+              ...stripEdgeObs(existingEdge),
               isLatest: false,
               tvalidEnd:
                 existingEdge.tvalidEnd || new Date().toISOString(),
               supersededBy: edge.id,
             };
+            await writeEdgeObs(kv, existingEdge.id, await readEdgeObs(kv, existingEdge));
             await kv.set(KV.graphEdges, existingEdge.id, updatedOld);
 
             await kv.set(KV.graphEdgeHistory, existingEdge.id, updatedOld);
@@ -253,7 +273,8 @@ export function registerTemporalGraphFunctions(
             edge.version = (existingEdge.version || 1) + 1;
           }
 
-          await kv.set(KV.graphEdges, edge.id, edge);
+          await writeEdgeObs(kv, edge.id, unionObs(edge.sourceObservationIds, obsIds));
+          await kv.set(KV.graphEdges, edge.id, stripEdgeObs(edge));
           existingEdges.push(edge);
         }
 
@@ -310,6 +331,21 @@ export function registerTemporalGraphFunctions(
 
       const allEntityEdges = [...relatedEdges, ...entityHistory];
 
+      // 返回值里带实体与边，来源数组必须补回来（热行里恒为空）。
+      // 关联边数量受实体度数约束，不是全量规模，这里一次批量读即可。
+      // 注意 graph:edge-history 里的行与 graph:edges 共用同一个边 id，
+      // 因此也由同一份 edge-obs 旁路记录覆盖。
+      const [hydratedEntity, hydratedEntityEdges] = await Promise.all([
+        hydrateNodesObs(kv, [entity]),
+        hydrateEdgesObs(kv, allEntityEdges),
+      ]);
+      const hydratedById = new Map(
+        hydratedEntityEdges.map((e) => [e.id, e] as const),
+      );
+      const hydratedOf = (edge: GraphEdge): GraphEdge =>
+        hydratedById.get(edge.id) ?? edge;
+      const resolvedEntity = hydratedEntity[0] ?? entity;
+
       if (data.asOf) {
         const asOfTime = new Date(data.asOf).getTime();
         const validEdges = allEntityEdges.filter((e) => {
@@ -332,10 +368,10 @@ export function registerTemporalGraphFunctions(
         const historical = data.includeHistory ? validEdges : [];
 
         return {
-          entity,
-          currentEdges,
-          historicalEdges: historical,
-          timeline: buildTimeline(allEntityEdges),
+          entity: resolvedEntity,
+          currentEdges: currentEdges.map(hydratedOf),
+          historicalEdges: historical.map(hydratedOf),
+          timeline: buildTimeline(allEntityEdges.map(hydratedOf)),
         };
       }
 
@@ -344,10 +380,12 @@ export function registerTemporalGraphFunctions(
       );
 
       return {
-        entity,
-        currentEdges,
-        historicalEdges: data.includeHistory ? entityHistory : [],
-        timeline: buildTimeline(allEntityEdges),
+        entity: resolvedEntity,
+        currentEdges: currentEdges.map(hydratedOf),
+        historicalEdges: data.includeHistory
+          ? entityHistory.map(hydratedOf)
+          : [],
+        timeline: buildTimeline(allEntityEdges.map(hydratedOf)),
       };
     },
   );

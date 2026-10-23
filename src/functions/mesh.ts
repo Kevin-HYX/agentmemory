@@ -3,6 +3,14 @@ import type { StateKV } from "../state/kv.js";
 import { KV, generateId } from "../state/schema.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { recordAudit } from "./audit.js";
+import {
+  hydrateEdgesObs,
+  hydrateNodesObs,
+  stripEdgeObs,
+  stripNodeObs,
+  writeEdgeObs,
+  writeNodeObs,
+} from "../state/graph-provenance.js";
 import type {
   MeshPeer,
   Memory,
@@ -80,6 +88,10 @@ async function lwwMergeList<T extends { id: string }>(
   items: T[] | undefined,
   lockPrefix: string,
   tsField: "updatedAt" | "createdAt",
+  // 写入前的钩子。图谱行需要先把来源数组搬到旁路 scope、再把热行置空
+  // （见 state/graph-provenance.ts），这件事与 LWW 合并无关，所以用回调
+  // 注入，而不是把图谱专用的分支塞进这个通用函数。
+  beforeWrite?: (item: T) => Promise<T>,
 ): Promise<number> {
   if (!items || !Array.isArray(items)) return 0;
   let count = 0;
@@ -90,12 +102,12 @@ async function lwwMergeList<T extends { id: string }>(
     const wrote = await withKeyedLock(`${lockPrefix}:${item.id}`, async () => {
       const existing = await kv.get<T>(scope, item.id);
       if (!existing) {
-        await kv.set(scope, item.id, item);
+        await kv.set(scope, item.id, beforeWrite ? await beforeWrite(item) : item);
         return true;
       }
       const existingTs = (existing as Record<string, unknown>)[tsField] as string;
       if (new Date(ts) > new Date(existingTs)) {
-        await kv.set(scope, item.id, item);
+        await kv.set(scope, item.id, beforeWrite ? await beforeWrite(item) : item);
         return true;
       }
       return false;
@@ -103,6 +115,14 @@ async function lwwMergeList<T extends { id: string }>(
     if (wrote) count++;
   }
   return count;
+}
+
+// 边从 mesh 同步进来时同样带着来源数组（发送侧已 hydrate），落盘按新约定拆分。
+function graphEdgeWriteHook(kv: StateKV) {
+  return async (edge: GraphEdge): Promise<GraphEdge> => {
+    await writeEdgeObs(kv, edge.id, edge.sourceObservationIds ?? []);
+    return stripEdgeObs(edge);
+  };
 }
 
 function graphNodeTs(node: GraphNode): string {
@@ -122,11 +142,13 @@ async function lwwMergeGraphNodes(
     const wrote = await withKeyedLock(`mem:gnode:${item.id}`, async () => {
       const existing = await kv.get<GraphNode>(KV.graphNodes, item.id);
       if (!existing) {
-        await kv.set(KV.graphNodes, item.id, item);
+        await writeNodeObs(kv, item.id, item.sourceObservationIds ?? []);
+        await kv.set(KV.graphNodes, item.id, stripNodeObs(item));
         return true;
       }
       if (new Date(ts) > new Date(graphNodeTs(existing))) {
-        await kv.set(KV.graphNodes, item.id, item);
+        await writeNodeObs(kv, item.id, item.sourceObservationIds ?? []);
+        await kv.set(KV.graphNodes, item.id, stripNodeObs(item));
         return true;
       }
       return false;
@@ -361,7 +383,14 @@ export function registerMeshFunction(
         }
       }
       accepted += await lwwMergeGraphNodes(kv, data.graphNodes);
-      accepted += await lwwMergeList(kv, KV.graphEdges, data.graphEdges, "mem:gedge", "createdAt");
+      accepted += await lwwMergeList(
+          kv,
+          KV.graphEdges,
+          data.graphEdges,
+          "mem:gedge",
+          "createdAt",
+          graphEdgeWriteHook(kv),
+        );
       await recordAudit(kv, "mesh_sync", "mem::mesh-receive", [], {
         action: "mesh.receive",
         accepted,
@@ -437,14 +466,18 @@ async function collectSyncData(
 
   if (scopes.includes("graph:nodes") && !projectScoped) {
     const all = await kv.list<GraphNode>(KV.graphNodes);
-    result.graphNodes = all.filter(
+    // 同步载荷必须带上来源数组，否则对端合并后会丢掉来源链
+    // （接收侧的 lwwMergeGraphNodes 正是把它写进旁路 scope 的）。
+    const delta = all.filter(
       (n) => new Date(graphNodeTs(n)).getTime() > sinceTime,
     );
+    result.graphNodes = await hydrateNodesObs(kv, delta);
   }
 
   if (scopes.includes("graph:edges") && !projectScoped) {
     const all = await kv.list<GraphEdge>(KV.graphEdges);
-    result.graphEdges = deltaFilter(all, sinceTime, "createdAt");
+    const delta = deltaFilter(all, sinceTime, "createdAt");
+    result.graphEdges = await hydrateEdgesObs(kv, delta);
   }
 
   return result;
@@ -488,7 +521,14 @@ async function applySyncData(
     applied += await lwwMergeGraphNodes(kv, data.graphNodes);
   }
   if (scopes.includes("graph:edges")) {
-    applied += await lwwMergeList(kv, KV.graphEdges, data.graphEdges, "mem:gedge", "createdAt");
+    applied += await lwwMergeList(
+          kv,
+          KV.graphEdges,
+          data.graphEdges,
+          "mem:gedge",
+          "createdAt",
+          graphEdgeWriteHook(kv),
+        );
   }
 
   return applied;

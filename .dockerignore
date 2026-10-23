@@ -1,0 +1,18 @@
+# Docker 构建上下文过滤 —— 只保留编译所需文件，避免传输 .git / node_modules
+.git
+.github
+node_modules
+dist
+website
+docs
+READMEs
+benchmark
+eval
+test
+__mocks__
+assets
+examples
+integrations
+plugin
+scripts
+*.md

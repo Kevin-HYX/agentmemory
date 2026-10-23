@@ -1577,6 +1577,45 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/graph/reset", http_method: "POST" },
   });
 
+  // 来源数组外置的存量迁移端点。
+  //
+  // 图谱的来源追溯（sourceObservationIds）从热行搬到了 mem:graph:node-obs /
+  // edge-obs，热行因此从 362MB 降到 11.7MB。读取侧对尚未迁移的数据是向后
+  // 兼容的（旁路缺失时回退到热行内的旧值），但要真正拿到「枚举不再打挂心跳」
+  // 的收益，存量语料必须跑一次这个端点。
+  //
+  // 幂等，可按分片重入；不删除任何数据 —— 来源数组只是换了个地方存。
+  sdk.registerFunction("api::graph-provenance-backfill",
+    async (req: ApiRequest): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      try {
+        const result = await sdk.trigger({
+          function_id: "mem::graph-provenance-backfill",
+          payload: {},
+        });
+        return { status_code: 200, body: result };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          status_code: 500,
+          body: {
+            success: false,
+            error: `graph provenance backfill failed: ${message}`,
+          },
+        };
+      }
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::graph-provenance-backfill",
+    config: {
+      api_path: "/agentmemory/graph/provenance-backfill",
+      http_method: "POST",
+    },
+  });
+
   sdk.registerFunction("api::graph-extract",
     async (req: ApiRequest<{ observations: unknown[] }>): Promise<Response> => {
       const authErr = checkAuth(req, secret);
