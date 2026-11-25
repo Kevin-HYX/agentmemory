@@ -8,6 +8,8 @@ import { ContextFunnel } from "@/components/site/ContextFunnel";
 import { InfraTiles } from "@/components/site/InfraTiles";
 import { MemoryScroll } from "@/components/site/MemoryScroll";
 import { Benchmarks } from "@/components/site/Benchmarks";
+import { Runtime } from "@/components/site/Runtime";
+import { Scale } from "@/components/site/Scale";
 import { Agents } from "@/components/site/Agents";
 import { LocalFirst } from "@/components/site/LocalFirst";
 import { Interfaces } from "@/components/site/Interfaces";
@@ -25,16 +27,18 @@ export default function Page() {
         <Hero />
         <Proof />
         <Featured />
+        <Interfaces />
         <UseCases />
+        <Runtime />
         <ContextFunnel />
         <InfraTiles />
         <MemoryScroll />
         <InTheWild />
         <Research />
+        <Scale />
         <Benchmarks />
         <Agents />
         <LocalFirst />
-        <Interfaces />
         <Faq />
         <Install />
       </main>

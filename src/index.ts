@@ -5,6 +5,7 @@ import {
   getEnvVar,
   loadEmbeddingConfig,
   loadFallbackConfig,
+  embeddingOptInHint,
   loadClaudeBridgeConfig,
   loadTeamConfig,
   loadSnapshotConfig,
@@ -22,6 +23,7 @@ import {
   isGraphCompactOnBootEnabled,
   getSessionSweepStaleHours,
   getFinalizeIdleMs,
+  getAutoForgetIntervalMs,
 } from "./config.js";
 import {
   createProvider,
@@ -30,15 +32,16 @@ import {
   createImageEmbeddingProvider,
 } from "./providers/index.js";
 import { StateKV } from "./state/kv.js";
+import { assertStateReady, waitForStateReady } from "./state/state-readiness.js";
 import { VectorIndex } from "./state/vector-index.js";
 import type { SearchLayer } from "./state/search-layer.js";
 import { HybridSearch } from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
 import { SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_HARD_EXIT_MS, runStartupCleanup, settleWithin } from "./shutdown.js";
 import { registerPrivacyFunction, withWriteScrubbing } from "./functions/privacy.js";
+import { withRegistrationDefaults } from "./runtime/registration.js";
 import { registerObserveFunction } from "./functions/observe.js";
 import { registerCaptureFunctions } from "./functions/capture.js";
-import { seedViewerStreamTracker } from "./state/viewer-stream.js";
 import { registerImageQuotaCleanup } from "./functions/image-quota-cleanup.js";
 import { registerVisionSearchFunctions } from "./functions/vision-search.js";
 import { registerSlotsFunctions, isSlotsEnabled, isReflectEnabled } from "./functions/slots.js";
@@ -50,6 +53,7 @@ import {
   isBm25RebuildIncomplete,
   isMemoryIndexReady,
   rebuildKeywordIndex,
+  stopKeywordRebuildRetry,
   markKeywordRebuildPending,
   getSearchIndex,
   setVectorIndex,
@@ -96,6 +100,7 @@ import { registerSignalsFunction } from "./functions/signals.js";
 import { registerCheckpointsFunction } from "./functions/checkpoints.js";
 import { registerFlowCompressFunction } from "./functions/flow-compress.js";
 import { registerMeshFunction } from "./functions/mesh.js";
+import { singleFlight } from "./functions/status.js";
 import { registerBranchAwareFunction } from "./functions/branch-aware.js";
 import { registerSentinelsFunction } from "./functions/sentinels.js";
 import { registerSketchesFunction } from "./functions/sketches.js";
@@ -119,13 +124,13 @@ import { registerReplayFunctions } from "./functions/replay.js";
 import { registerApiTriggers } from "./triggers/api.js";
 import { registerEventTriggers } from "./triggers/events.js";
 import { registerViewerStreamTriggers } from "./triggers/viewer-streams.js";
+import { registerViewerSse } from "./triggers/viewer-sse.js";
 import { registerMcpEndpoints } from "./mcp/server.js";
 import { getAllTools } from "./mcp/tools-registry.js";
 import { startViewerServer } from "./viewer/server.js";
 import { MetricsStore } from "./eval/metrics-store.js";
 import { DedupMap } from "./functions/dedup.js";
 import { registerHealthMonitor } from "./health/monitor.js";
-import { createStreamRelayProbe } from "./health/stream-relay-probe.js";
 import { initMetrics, OTEL_CONFIG } from "./telemetry/setup.js";
 import { VERSION } from "./version.js";
 import { bootLog, bootWarn } from "./logger.js";
@@ -138,6 +143,9 @@ function workerPidfilePath(): string {
   return runtimeMetadataPath("worker.pid");
 }
 function writeWorkerPidfile(): void {
+  // Worker Compose owns the entire process lifecycle. Its supervised container
+  // PID is authoritative; do not create a second ownership record.
+  if (process.env["III_COMPOSE_FILE"]) return;
   try {
     const p = workerPidfilePath();
     mkdirSync(dirname(p), { recursive: true });
@@ -147,6 +155,7 @@ function writeWorkerPidfile(): void {
   }
 }
 function clearWorkerPidfile(): void {
+  if (process.env["III_COMPOSE_FILE"]) return;
   try {
     unlinkSync(workerPidfilePath());
   } catch {}
@@ -189,6 +198,10 @@ function resolveWorkerSecret(): string {
   }
 }
 
+// Revisions whose release failed while superseding an incremental backfill.
+// Shutdown retries; failures stay owned here instead of being dropped.
+const unreleasedSupersededRevisions: Array<{ id: string; revision: { release(): void } }> = [];
+
 async function main() {
   // Fold ~/.agentmemory/.env into process.env before anything reads config
   // or raw process.env. Only-if-unset, so real process.env still wins.
@@ -199,7 +212,7 @@ async function main() {
   const fallbackConfig = loadFallbackConfig();
 
   const provider =
-    fallbackConfig.providers.length > 0
+    fallbackConfig.providers.length > 0 && config.provider.provider !== "noop"
       ? createFallbackProvider(config.provider, fallbackConfig)
       : createProvider(config.provider);
 
@@ -217,6 +230,8 @@ async function main() {
     );
   } else {
     bootLog(`Embedding provider: none (BM25-only mode)`);
+    const embeddingHint = embeddingOptInHint();
+    if (embeddingHint) bootLog(embeddingHint);
   }
   if (imageEmbeddingProvider) {
     bootLog(
@@ -226,9 +241,8 @@ async function main() {
   bootLog(
     `REST API: http://localhost:${config.restPort}/agentmemory/*`,
   );
-  bootLog(`Streams: ws://localhost:${config.streamsPort}`);
 
-  const sdk = withWriteScrubbing(registerWorker(config.engineUrl, {
+  const sdk = withWriteScrubbing(withRegistrationDefaults(registerWorker(config.engineUrl, {
     workerName: "agentmemory",
     invocationTimeoutMs: 180000,
     otel: {
@@ -248,7 +262,7 @@ async function main() {
       language: "node",
       framework: "iii-sdk",
     },
-  }));
+  })));
 
   writeWorkerPidfile();
 
@@ -257,6 +271,16 @@ async function main() {
     stateBackend = getStateBackend();
   } catch {}
   const kv = new StateKV(sdk, { backend: stateBackend });
+  const stateReadiness = await waitForStateReady(sdk, {
+    onWaiting: (error) =>
+      bootWarn(`Waiting for the state worker to register state::get and state::list (${error})`),
+  });
+  assertStateReady(stateReadiness);
+  if (stateReadiness.attempts > 1) {
+    bootLog(
+      `State worker ready after ${stateReadiness.waitedMs}ms (${stateReadiness.attempts} attempts)`,
+    );
+  }
   const secret = resolveWorkerSecret();
   const metricsStore = new MetricsStore(kv);
   const dedupMap = new DedupMap();
@@ -436,8 +460,8 @@ async function main() {
     graphWeight,
   );
 
-  const hybridRanker = (query: string, limit: number, targetLayer?: SearchLayer, authorizeGraph?: Parameters<HybridSearch["search"]>[3]) =>
-    hybridSearch.search(query, limit, targetLayer, authorizeGraph);
+  const hybridRanker = (query: string, limit: number, targetLayer?: SearchLayer, authorizeGraph?: Parameters<HybridSearch["search"]>[3], request?: Parameters<HybridSearch["search"]>[4]) =>
+    hybridSearch.search(query, limit, targetLayer, authorizeGraph, request);
   registerSmartSearchFunction(sdk, kv, hybridRanker);
   setHybridRanker(hybridRanker);
   registerRecentSearchesSweepFunction(sdk, kv);
@@ -446,14 +470,10 @@ async function main() {
   registerApiTriggers(sdk, kv, secret, metricsStore, provider);
   registerEventTriggers(sdk, kv);
   registerViewerStreamTriggers(sdk, kv, { secret, metricsStore, provider });
+  registerViewerSse(sdk);
   registerMcpEndpoints(sdk, kv, secret);
 
-  const healthMonitor = registerHealthMonitor(sdk, kv, {
-    streamRelayProbe:
-      kv.backend === "redis"
-        ? createStreamRelayProbe(sdk, { url: `ws://localhost:${config.streamsPort}` })
-        : undefined,
-  });
+  const healthMonitor = registerHealthMonitor(sdk, kv);
 
   const indexPersistence = new IndexPersistence(kv, vectorIndex, { requireRecoveryPlan: true });
   setIndexPersistence(indexPersistence);
@@ -535,7 +555,28 @@ async function main() {
 
   const keywordStart = Date.now();
   try {
-    const keyword = await rebuildKeywordIndex(kv, vectorBackfillSince);
+    let keyword = await rebuildKeywordIndex(kv, vectorBackfillSince);
+    let supersededReleaseFailed = false;
+    if (typeof vectorBackfillSince === "string" && !indexPersistence.isRecoveryPaused() && keyword.historicalVectorGaps > 0) {
+      for (const job of keyword.vectorJobs) {
+        const revision = job.revision;
+        if (!revision) continue;
+        try {
+          revision.release();
+        } catch (err) {
+          supersededReleaseFailed = true;
+          unreleasedSupersededRevisions.push({ id: job.id, revision });
+          bootWarn(`Failed to release superseded vector revision ${job.id}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      // Jobs are superseded only after every watch is released. A failed release
+      // stays in unreleasedSupersededRevisions; do not rebuild or embed over it.
+      keyword.vectorJobs = [];
+      if (!supersededReleaseFailed) {
+        vectorBackfillSince = await indexPersistence.prepareBackfill(loaded, true);
+        if (vectorBackfillSince === null) keyword = await rebuildKeywordIndex(kv, vectorBackfillSince);
+      }
+    }
     bootLog(
       `Rebuilt BM25 index from stored content (${keyword.documents} docs in ${Date.now() - keywordStart} ms)`,
     );
@@ -545,24 +586,24 @@ async function main() {
     const activeIds = new Set(keyword.vectorJobs.map((job) => job.id));
     const hasVector = (id: string) => Boolean(vectorIndex?.has(id));
     const countRemaining = () => bm25Index.countMissingDocuments(hasVector, vectorBackfillSince, activeIds);
-    setPendingVectorBackfillCount(indexPersistence.isRecoveryPaused() ? countRemaining() : pending);
-    if (indexPersistence.isRecoveryPaused()) {
+    setPendingVectorBackfillCount(indexPersistence.isRecoveryPaused() || supersededReleaseFailed ? countRemaining() : pending);
+    if (supersededReleaseFailed || indexPersistence.isRecoveryPaused()) {
       setVectorBackfillState("paused");
     } else if (vectorBackfillSince !== undefined) {
-      setVectorBackfillState(keyword.fullBackfillPending > 0 && !optedIn ? "waiting-for-opt-in" : backlogScanComplete ? "idle" : "paused");
+      setVectorBackfillState(!backlogScanComplete ? "paused" : keyword.fullBackfillPending > 0 && !optedIn ? "waiting-for-opt-in" : "idle");
     }
     if (keyword.fullBackfillPending > 0) {
       bootLog(optedIn
         ? `Vector backfill has ${keyword.fullBackfillPending} additional documents beyond this start's limit; restart to resume.`
         : `Vector backfill needs ${keyword.fullBackfillPending} embeddings (set AGENTMEMORY_VECTOR_BACKFILL=all to opt in). See /agentmemory/status.`);
     }
-    if (vectorBackfillSince !== undefined && backlogScanComplete && pending === 0) {
+    if (!supersededReleaseFailed && vectorBackfillSince !== undefined && backlogScanComplete && pending === 0) {
       if (!(await indexPersistence.completeBackfill(() => countRemaining() === 0))) {
         setPendingVectorBackfillCount(countRemaining());
         setVectorBackfillState("paused");
       }
     }
-    if (keyword.vectorJobs.length > 0 && !(await indexPersistence.beginBackfill())) {
+    if (keyword.vectorJobs.length > 0 && (!backlogScanComplete || !(await indexPersistence.beginBackfill()))) {
       setVectorBackfillState("paused");
       activeIds.clear();
       for (const job of keyword.vectorJobs) job.revision?.release();
@@ -603,7 +644,7 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 143 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 147 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,
@@ -650,13 +691,17 @@ async function main() {
     setGraphCompactBootDisabled();
   }
 
-  const autoForgetIntervalMs = parseInt(process.env.AUTO_FORGET_INTERVAL_MS || "3600000", 10);
+  const autoForgetIntervalMs = getAutoForgetIntervalMs();
   const consolidationIntervalMs = getConsolidationIntervalMs();
 
   if (process.env.AUTO_FORGET_ENABLED !== "false") {
+    const runAutoForget = singleFlight(
+      () => sdk.trigger({ function_id: "mem::auto-forget", payload: { dryRun: false } }),
+      0,
+    );
     const autoForgetTimer = setInterval(async () => {
       try {
-        await sdk.trigger({ function_id: "mem::auto-forget", payload: { dryRun: false } });
+        await runAutoForget();
       } catch {}
     }, autoForgetIntervalMs);
     autoForgetTimer.unref();
@@ -708,7 +753,6 @@ async function main() {
   }, 60 * 60 * 1000);
   recentSearchesSweepTimer.unref();
 
-  void seedViewerStreamTracker(sdk, { unorderedListing: kv.backend === "redis" }).catch(() => {});
 
   if (isSessionSweepEnabled()) {
     const sessionSweepTimer = setInterval(async () => {
@@ -752,6 +796,16 @@ async function main() {
 
   const shutdown = async () => {
     console.log(`\n[agentmemory] Shutting down...`);
+    for (let i = 0; i < unreleasedSupersededRevisions.length; ) {
+      const held = unreleasedSupersededRevisions[i];
+      try {
+        held.revision.release();
+        unreleasedSupersededRevisions.splice(i, 1);
+      } catch (err) {
+        console.warn(`[agentmemory] Failed to release superseded vector revision ${held.id}:`, err);
+        i++;
+      }
+    }
     const hardExit = setTimeout(async () => {
       console.warn(
         `[agentmemory] Shutdown still blocked after ${SHUTDOWN_HARD_EXIT_MS}ms; exiting now.`,
@@ -763,6 +817,7 @@ async function main() {
     healthMonitor.stop();
     dedupMap.stop();
     capture.stop();
+    stopKeywordRebuildRetry();
     clearInterval(sessionFinalizeTimer);
     await settleWithin(graphIndexMigration.stop(), SHUTDOWN_FLUSH_TIMEOUT_MS);
     indexPersistence.stop();

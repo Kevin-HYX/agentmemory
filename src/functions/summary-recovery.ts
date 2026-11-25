@@ -4,9 +4,10 @@ import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { logger } from "../logger.js";
+import { isAutoCompressEnabled } from "../config.js";
 import { compressionInFlight } from "./compress.js";
 import { compressionRaw, needsCompression, type StoredObservation } from "./compression-state.js";
-import { summaryCovers, summaryObservations } from "./summary-state.js";
+import { getSummaryTriggerTimeoutMs, summaryCovers, summaryObservations } from "./summary-state.js";
 
 export const SUMMARY_RETRY_MS = 30_000;
 export const SUMMARY_RETRY_MAX_MS = 60 * 60_000;
@@ -37,7 +38,7 @@ export function registerSummaryRecoveryFunction(sdk: IIIClient, kv: StateKV, has
           let observations = await kv.list<StoredObservation>(KV.observations(sessionId));
           const pending = observations.filter(needsCompression);
           if (!pending.some((row) => compressionInFlight(kv, sessionId, row.id))) {
-            if (pending.length) {
+            if (pending.length && isAutoCompressEnabled()) {
               const retried = await sdk.trigger<Record<string, unknown>, CompressionRetryResult>({
                 function_id: "mem::compression-retry",
                 payload: { sessionId, limit: 1, ...(compressionCursor ? { cursor: compressionCursor } : {}) },
@@ -49,7 +50,7 @@ export function registerSummaryRecoveryFunction(sdk: IIIClient, kv: StateKV, has
             const remaining = observations.filter(needsCompression);
             if (remaining.length === 0) {
               const result = await sdk.trigger<{ sessionId: string }, { success?: boolean; incomplete?: boolean }>({
-                function_id: "mem::summarize", payload: { sessionId },
+                function_id: "mem::summarize", payload: { sessionId }, timeoutMs: getSummaryTriggerTimeoutMs(),
               });
               if (!result?.success || result.incomplete) lastError = "summary_failed";
             } else if (remaining.every((row) => !compressionRaw(row))) {

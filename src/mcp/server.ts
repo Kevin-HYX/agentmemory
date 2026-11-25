@@ -1,22 +1,19 @@
 import type { IIIClient } from "iii-sdk";
 import type { HttpRequest } from "@iii-dev/helpers/http";
 import type { StateKV } from "../state/kv.js";
+import { collectAll } from "../state/kv.js";
 import { KV } from "../state/schema.js";
-import { pinGraphState } from "../state/graph-generation.js";
-import type {
-  SessionSummary,
-  Memory,
-  Session,
-  GraphNode,
-  GraphEdge,
-} from "../types.js";
-import { getVisibleTools } from "./tools-registry.js";
+import type { SessionSummary, Memory, Session } from "../types.js";
+import { getAllTools, getVisibleTools } from "./tools-registry.js";
 import { parseSearchExpansionIds } from "./search-arguments.js";
 import { parseSessionArguments } from "./session-arguments.js";
+import { normalizeRememberFields, normalizeStringList as parseCsvList, rememberFieldsError } from "./remember-arguments.js";
 import { isSearchLayer } from "../state/search-layer.js";
-import { checkAuth } from "../triggers/api.js";
+import { insightHttpResponse } from "../state/insight-response.js";
+import { checkAuth, slotsDisabledResponse } from "../triggers/api.js";
+import { isSlotsEnabled } from "../functions/slots.js";
+import { LESSON_SOURCE_IDS_MAX, normalizeLessonSourceIds } from "../functions/lessons.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
-
 type McpResponse = {
   status_code: number;
   headers?: Record<string, string>;
@@ -33,16 +30,12 @@ function asNumber(value: unknown, fallback?: number): number | undefined {
   return fallback;
 }
 
-function parseCsvList(value: unknown): string[] {
-  if (typeof value === "string") {
-    return value.split(",").map((v) => v.trim()).filter(Boolean);
-  }
-  if (Array.isArray(value)) {
-    return value
-      .map((v) => (typeof v === "string" ? v.trim() : ""))
-      .filter(Boolean);
-  }
-  return [];
+const SLOT_TOOL_NAMES = new Set(
+  getAllTools().filter((t) => t.name.startsWith("memory_slot_")).map((t) => t.name),
+);
+
+function isSlotTool(name: string): boolean {
+  return SLOT_TOOL_NAMES.has(name);
 }
 
 export function registerMcpEndpoints(
@@ -50,11 +43,13 @@ export function registerMcpEndpoints(
   kv: StateKV,
   secret?: string,
 ): void {
-  sdk.registerFunction("mcp::tools::list", 
+  const slotsEnabled = isSlotsEnabled();
+  sdk.registerFunction("mcp::tools::list",
     async (req: HttpRequest): Promise<McpResponse> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      return { status_code: 200, body: { tools: getVisibleTools() } };
+      const tools = getVisibleTools().filter((t) => slotsEnabled || !isSlotTool(t.name));
+      return { status_code: 200, body: { tools } };
     },
   );
   sdk.registerTrigger({
@@ -75,6 +70,8 @@ export function registerMcpEndpoints(
       }
 
       const { name, arguments: args = {} } = req.body;
+
+      if (isSlotTool(name) && !slotsEnabled) return slotsDisabledResponse();
 
       try {
         switch (name) {
@@ -164,15 +161,9 @@ export function registerMcpEndpoints(
                 body: { error: "content is required for memory_save" },
               };
             }
+            const fieldError = rememberFieldsError(args);
+            if (fieldError) return { status_code: 400, body: { error: fieldError } };
             const type = (args.type as string) || "fact";
-            const concepts =
-              typeof args.concepts === "string"
-                ? args.concepts.split(",").map((c: string) => c.trim()).filter(Boolean)
-                : [];
-            const files =
-              typeof args.files === "string"
-                ? args.files.split(",").map((f: string) => f.trim()).filter(Boolean)
-                : [];
 
             const project =
               typeof args.project === "string" && args.project.trim().length > 0
@@ -186,8 +177,7 @@ export function registerMcpEndpoints(
             const result = await sdk.trigger({ function_id: "mem::remember", payload: {
               content: args.content,
               type,
-              concepts,
-              files,
+              ...normalizeRememberFields(args),
               ...(project !== undefined && { project }),
               ...(saveAgentId !== undefined && { agentId: saveAgentId }),
             } });
@@ -704,6 +694,13 @@ export function registerMcpEndpoints(
                 body: { error: "title is required" },
               };
             }
+            if (args.agentId !== undefined && typeof args.agentId !== "string") {
+              return { status_code: 400, body: { error: "agentId must be a string" } };
+            }
+            const creatorId = typeof args.agentId === "string" ? args.agentId.trim() : "";
+            if (creatorId.length > 128) {
+              return { status_code: 400, body: { error: "agentId must be at most 128 characters" } };
+            }
             const edges: Array<{ type: string; targetActionId: string }> = [];
             if (typeof args.requires === "string" && args.requires.trim()) {
               for (const id of args.requires.split(",").map((s: string) => s.trim()).filter(Boolean)) {
@@ -721,6 +718,7 @@ export function registerMcpEndpoints(
               tags,
               parentId: args.parentId,
               edges: edges.length > 0 ? edges : undefined,
+              createdBy: creatorId || getAgentId(),
             } });
             return {
               status_code: 200,
@@ -1137,6 +1135,10 @@ export function registerMcpEndpoints(
             const lessonTags = typeof args.tags === "string" && args.tags.trim()
               ? args.tags.split(",").map((t: string) => t.trim()).filter(Boolean)
               : [];
+            const lessonSourceIds = normalizeLessonSourceIds(args.sourceIds);
+            if (!lessonSourceIds) {
+              return { status_code: 400, body: { error: `sourceIds must be an array of at most ${LESSON_SOURCE_IDS_MAX} ids (session, memory, observation or crystal ids) without spaces` } };
+            }
             const lessonSaveResult = await sdk.trigger({ function_id: "mem::lesson-save", payload: {
               content: args.content,
               context: args.context || "",
@@ -1144,6 +1146,7 @@ export function registerMcpEndpoints(
               project: args.project,
               tags: lessonTags,
               source: "manual",
+              sourceIds: lessonSourceIds,
             } });
             return { status_code: 200, body: { content: [{ type: "text", text: JSON.stringify(lessonSaveResult, null, 2) }] } };
           }
@@ -1176,7 +1179,7 @@ export function registerMcpEndpoints(
               project: args.project,
               maxClusters: args.maxClusters,
             } });
-            return { status_code: 200, body: { content: [{ type: "text", text: JSON.stringify(reflectResult, null, 2) }] } };
+            return insightHttpResponse(reflectResult, true);
           }
 
           case "memory_insight_list": {
@@ -1185,7 +1188,7 @@ export function registerMcpEndpoints(
               minConfidence: args.minConfidence,
               limit: args.limit,
             } });
-            return { status_code: 200, body: { content: [{ type: "text", text: JSON.stringify(insightListResult, null, 2) }] } };
+            return insightHttpResponse(insightListResult, true);
           }
 
           case "memory_obsidian_export": {
@@ -1393,9 +1396,13 @@ export function registerMcpEndpoints(
 
       try {
         if (uri === "agentmemory://status") {
-          const sessions = await kv.list<Session>(KV.sessions);
-          const memories = await kv.list<Memory>(KV.memories);
-          const healthData = await kv.list(KV.health).catch(() => []);
+          const countScope = async (scope: string): Promise<number> =>
+            typeof kv.count === "function"
+              ? kv.count(scope)
+              : (await kv.list(scope)).length;
+          const sessionCount = await countScope(KV.sessions);
+          const memoryCount = await countScope(KV.memories);
+          const healthCount = await countScope(KV.health).catch(() => 0);
           return {
             status_code: 200,
             body: {
@@ -1404,10 +1411,10 @@ export function registerMcpEndpoints(
                   uri,
                   mimeType: "application/json",
                   text: JSON.stringify({
-                    sessionCount: sessions.length,
-                    memoryCount: memories.length,
+                    sessionCount,
+                    memoryCount,
                     healthStatus:
-                      healthData.length > 0 ? "available" : "no-data",
+                      healthCount > 0 ? "available" : "no-data",
                   }),
                 },
               ],
@@ -1482,7 +1489,7 @@ export function registerMcpEndpoints(
         }
 
         if (uri === "agentmemory://memories/latest") {
-          const memories = await kv.list<Memory>(KV.memories);
+          const memories = await collectAll<Memory>(kv, KV.memories);
           const latest = memories
             .filter((m) => m.isLatest)
             .sort(
@@ -1513,15 +1520,10 @@ export function registerMcpEndpoints(
 
         if (uri === "agentmemory://graph/stats") {
           try {
-            const graphState = await pinGraphState(kv);
-            const nodes = await graphState.list<GraphNode>(KV.graphNodes);
-            const edges = await graphState.list<GraphEdge>(KV.graphEdges);
-            const nodesByType: Record<string, number> = {};
-            for (const n of nodes)
-              nodesByType[n.type] = (nodesByType[n.type] || 0) + 1;
-            const edgesByType: Record<string, number> = {};
-            for (const e of edges)
-              edgesByType[e.type] = (edgesByType[e.type] || 0) + 1;
+            const stats = await sdk.trigger({
+              function_id: "mem::graph-stats",
+              payload: {},
+            });
             return {
               status_code: 200,
               body: {
@@ -1529,12 +1531,7 @@ export function registerMcpEndpoints(
                   {
                     uri,
                     mimeType: "application/json",
-                    text: JSON.stringify({
-                      totalNodes: nodes.length,
-                      totalEdges: edges.length,
-                      nodesByType,
-                      edgesByType,
-                    }),
+                    text: JSON.stringify(stats),
                   },
                 ],
               },
@@ -1548,8 +1545,15 @@ export function registerMcpEndpoints(
                     uri,
                     mimeType: "application/json",
                     text: JSON.stringify({
-                      totalNodes: 0,
-                      totalEdges: 0,
+                      totalNodes: null,
+                      totalEdges: null,
+                      nodesByType: {},
+                      edgesByType: {},
+                      fromSnapshot: false,
+                      fromIndex: false,
+                      available: false,
+                      coverage: "unknown",
+                      warning: "Graph stats are unavailable. Check agentmemory graph-index status.",
                     }),
                   },
                 ],
@@ -1701,7 +1705,7 @@ export function registerMcpEndpoints(
                 payload: { query: taskDesc, limit: 10 },
               })
               .catch(() => ({ results: [] }));
-            const memories = await kv.list<Memory>(KV.memories);
+            const memories = await collectAll<Memory>(kv, KV.memories);
             const isolated = isAgentScopeIsolated();
             const activeAgentId = isolated ? getAgentId() : undefined;
             const relevant =

@@ -12,6 +12,7 @@ function fixture(scopes = ['mem:insights']) {
     let rows = store.get(p.scope);
     if (function_id === 'state::get') return rows?.get(p.key) ?? null;
     if (function_id === 'state::list') return [...(rows?.values() ?? [])];
+    if (function_id === 'state::list_keys') return { keys: [...(rows?.keys() ?? [])] };
     if (!rows) store.set(p.scope, rows = new Map());
     if (function_id === 'state::delete') return rows.delete(p.key);
     if (function_id === 'state::update') {
@@ -67,7 +68,7 @@ describe('原生分区状态', () => {
     const { kv, store, trigger } = fixture();
     store.set(partitionScope('mem:insights', 0), new Map([['one', { id: 'one' }], ['two', { id: 'two' }]]));
     for await (const row of kv.scan<{ id: string }>('mem:insights')) { expect(row.id).toBe('one'); break; }
-    expect(trigger.mock.calls.filter(([r]) => r.function_id === 'state::list')).toHaveLength(1);
+    expect(trigger.mock.calls.filter(([r]) => r.function_id === 'state::list_keys').map(([r]) => r.payload.scope)).toEqual([partitionScope('mem:insights', 0)]);
   });
 
   it('扫描无遗漏且不读取废弃的整表 scope', async () => {
@@ -78,6 +79,22 @@ describe('原生分区状态', () => {
     const scopes = trigger.mock.calls.filter(([r]) => r.function_id === 'state::list').map(([r]) => r.payload.scope);
     expect(scopes).toHaveLength(PARTITION_COUNT);
     expect(scopes).not.toContain('mem:insights');
+  });
+
+  it('按键读取、计数和游标分页覆盖配置的分区', async () => {
+    const { kv } = fixture();
+    const scope = 'mem:insights';
+    const first = { id: 'first' };
+    const second = { id: 'second' };
+    expect(partitionForKey(scope, first.id)).not.toBe(partitionForKey(scope, second.id));
+    await kv.set(scope, first.id, first);
+    await kv.set(scope, second.id, second);
+    expect(await kv.count(scope)).toBe(2);
+    expect(await kv.getMany(scope, [second.id, 'missing', first.id])).toEqual([second, null, first]);
+    const page = await kv.listPage(scope, { limit: 1, order: 'asc' });
+    expect(page).toEqual({ items: [first], total: 2, nextCursor: expect.any(String) });
+    await expect(kv.listPage(scope, { limit: 1, order: 'asc', cursor: page.nextCursor }))
+      .resolves.toEqual({ items: [second], total: 2 });
   });
 
   it('已固定的图视图在重置后仍读取原来的分区', async () => {

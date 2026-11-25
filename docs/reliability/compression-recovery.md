@@ -15,7 +15,7 @@ Inspection makes no model calls. `--retry` explicitly sends the retained source 
 agentmemory compression --session SESSION_ID --retry --json
 ```
 
-The command uses the running service selected by `AGENTMEMORY_URL`, `--port` or `--instance`, with the same authentication as other CLI requests. It fails if that service is unavailable and does not start a server. Separately, the running worker automatically retries pending compression needed by a persisted [session summary repair](summary-recovery.md), including after restart.
+The command uses the running service selected by `AGENTMEMORY_URL`, `--port` or `--instance`, with the same authentication as other CLI requests. It fails if that service is unavailable and does not start a server. An explicit `--retry` also works when automatic compression is disabled. Separately, with `AGENTMEMORY_AUTO_COMPRESS=true`, the running worker automatically retries pending compression needed by a persisted [session summary repair](summary-recovery.md), including after restart. When disabled, it retains that work for a manual retry or a later automatic attempt after re-enabling the setting.
 
 Choose a session or project; a global unscoped retry is rejected. Combining `--session`, `--project` and `--agent-id` narrows the selection. `--limit` defaults to 10 and accepts 1 through 100. Each page scans at most 20 sessions and 1,000 observations. Use the returned `nextCursor` with `--cursor` and the same scope to continue. A page can contain no candidates and still have a cursor.
 
@@ -34,4 +34,4 @@ The authenticated REST equivalents are:
 
 Both accept `project`, `agentId`, `limit` and `cursor`; at least `sessionId` or `project` is required. Results contain identifiers, status, safe error codes and counts. They do not return retained source or raw provider errors. A retry result with `success: false` exits the CLI with status 1. Inspect `recovered`, `items[].outcome` and `items[].retryable` for each batch; source-unavailable or concurrently changed rows are not model successes.
 
-Responses also obey the engine's 15 MiB payload allowance. If unusually large imported identifiers exceed it, REST returns HTTP 413 with a small error. Lower `--limit` or select one session. Already completed retries are not repeated when you inspect again.
+Responses also obey the engine's 60 MiB payload allowance. If unusually large imported identifiers exceed it, REST returns HTTP 413 with a small error. Lower `--limit` or select one session. Already completed retries are not repeated when you inspect again.
