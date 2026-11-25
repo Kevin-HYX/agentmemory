@@ -1,6 +1,7 @@
 import type { IIIClient } from 'iii-sdk'
 import type { StoragePartitionLayout } from '../types.js'
 import { withKeyedLock } from './keyed-mutex.js'
+import { decodeCursor, encodeCursor } from './list-query.js'
 import { resolveGraphScope, notifyGraphGenerationChange } from './graph-generation.js'
 import { ensureGraphConsistency, noteGraphSnapshotWrite } from './graph-consistency.js'
 import { withGraphIndexMutation, withGraphSnapshotIndexBarrier, withGraphSnapshotUnknownMutation } from './graph-retrieval-index.js'
@@ -96,15 +97,32 @@ function idKey(value: unknown): string {
   return typeof id === 'string' ? id : typeof id === 'number' ? String(id) : ''
 }
 
+export function insertionOrderKey(value: unknown): { at: number; id: string } {
+  return { at: orderKey(value), id: idKey(value) }
+}
+
+export function compareInsertionOrder(
+  a: ReturnType<typeof insertionOrderKey>,
+  b: ReturnType<typeof insertionOrderKey>,
+): number {
+  if (a.at !== b.at) return a.at < b.at ? -1 : 1
+  if (a.id === b.id) return 0
+  return a.id < b.id ? -1 : 1
+}
+
 export function orderLikeInsertion<T>(values: T[]): T[] {
   return values
-    .map((value) => ({ value, at: orderKey(value), id: idKey(value) }))
-    .sort((a, b) => {
-      if (a.at !== b.at) return a.at < b.at ? -1 : 1
-      if (a.id === b.id) return 0
-      return a.id < b.id ? -1 : 1
-    })
+    .map((value) => ({ value, ...insertionOrderKey(value) }))
+    .sort(compareInsertionOrder)
     .map((entry) => entry.value)
+}
+
+export async function collectAll<T = unknown>(kv: StateKV, scope: string): Promise<T[]> {
+  if (typeof kv.iterate !== 'function') return kv.list<T>(scope)
+  const out: T[] = []
+  for await (const page of kv.iterate<T>(scope)) out.push(...page)
+  if (kv.backend === 'redis') return orderLikeInsertion(out)
+  return out
 }
 
 export class StateKV {
@@ -227,25 +245,153 @@ export class StateKV {
       return this.backend === 'redis' && Array.isArray(values) ? orderLikeInsertion(values) : values
     }
     const values: T[] = []
-    for await (const value of this.scanResolved<T>(scope, true)) values.push(value)
+    for (let index = 0; index < PARTITION_COUNT; index++) {
+      const shard = await this.sdk.trigger<{ scope: string }, T[]>({
+        function_id: 'state::list',
+        payload: { scope: partitionScope(scope, index) },
+      })
+      if (!Array.isArray(shard)) throw new Error(`状态列表返回值无效：${scope}`)
+      for (const value of shard) values.push(value)
+    }
     return orderLikeInsertion(values)
   }
 
   async *scan<T = unknown>(scope: string): AsyncGenerator<T> {
+    for await (const page of this.iterate<T>(scope)) yield* page
+  }
+
+  async listKeys(scope: string): Promise<string[]> {
+    scope = await resolveGraphScope(this, scope)
+    await ensureGraphConsistency(this, scope)
+    return this.rawListKeys(scope)
+  }
+
+  async count(scope: string): Promise<number> {
+    try {
+      return (await this.listKeys(scope)).length
+    } catch {
+      return (await this.list(scope)).length
+    }
+  }
+
+  private async rawListKeys(scope: string): Promise<string[]> {
+    if (!(await this.isPartitioned(scope))) return this.listPhysicalKeys(scope)
+    const keys: string[] = []
+    for (let index = 0; index < PARTITION_COUNT; index++) {
+      for (const key of await this.listPhysicalKeys(partitionScope(scope, index))) keys.push(key)
+    }
+    return keys
+  }
+
+  private async listPhysicalKeys(scope: string): Promise<string[]> {
+    const result = await this.sdk.trigger<{ scope: string }, unknown>({
+      function_id: 'state::list_keys',
+      payload: { scope },
+    })
+    if (Array.isArray(result)) return result as string[]
+    const keys = (result as { keys?: unknown })?.keys
+    return Array.isArray(keys) ? (keys as string[]) : []
+  }
+
+  async getMany<T = unknown>(
+    scope: string,
+    keys: string[],
+    opts: { concurrency?: number } = {},
+  ): Promise<Array<T | null>> {
+    scope = await resolveGraphScope(this, scope)
+    await ensureGraphConsistency(this, scope)
+    const concurrency = Math.min(64, Math.max(1, Math.floor(opts.concurrency ?? 16)))
+    return this.rawGetMany<T>(scope, keys, concurrency, await this.isPartitioned(scope))
+  }
+
+  private async rawGetMany<T = unknown>(
+    scope: string,
+    keys: string[],
+    concurrency: number,
+    partitioned: boolean,
+  ): Promise<Array<T | null>> {
+    const out: Array<T | null> = new Array(keys.length).fill(null)
+    for (let start = 0; start < keys.length; start += concurrency) {
+      const slice = keys.slice(start, start + concurrency)
+      const values = await Promise.all(
+        slice.map((key) =>
+          this.sdk.trigger<{ scope: string; key: string }, T | null>({
+            function_id: 'state::get',
+            payload: { scope: partitioned ? partitionForKey(scope, key) : scope, key },
+          }),
+        ),
+      )
+      for (let i = 0; i < slice.length; i++) out[start + i] = values[i] ?? null
+    }
+    return out
+  }
+
+  async *iterate<T = unknown>(
+    scope: string,
+    opts: { pageSize?: number } = {},
+  ): AsyncGenerator<T[]> {
+    const pageSize = Math.min(1000, Math.max(1, Math.floor(opts.pageSize ?? 200)))
     scope = await resolveGraphScope(this, scope)
     await ensureGraphConsistency(this, scope)
     const partitioned = await this.isPartitioned(scope)
-    yield* this.scanResolved<T>(scope, partitioned)
+    for (let index = 0; index < (partitioned ? PARTITION_COUNT : 1); index++) {
+      const physicalScope = partitioned ? partitionScope(scope, index) : scope
+      const keys = await this.listPhysicalKeys(physicalScope)
+      for (let start = 0; start < keys.length; start += pageSize) {
+        const values = await this.rawGetMany<T>(physicalScope, keys.slice(start, start + pageSize), 16, false)
+        let page = values.filter((value): value is T => value !== null && value !== undefined)
+        if (this.backend === 'redis') page = orderLikeInsertion(page)
+        if (page.length) yield page
+      }
+    }
   }
 
-  private async *scanResolved<T>(scope: string, partitioned: boolean): AsyncGenerator<T> {
-    for (let index = 0; index < (partitioned ? PARTITION_COUNT : 1); index++) {
-      const values = await this.sdk.trigger<{ scope: string }, T[]>({
-        function_id: 'state::list',
-        payload: { scope: partitioned ? partitionScope(scope, index) : scope },
-      })
-      if (!Array.isArray(values)) throw new Error(`状态列表返回值无效：${scope}`)
-      yield* values
+  async listPage<T = unknown>(
+    scope: string,
+    opts: { limit: number; cursor?: string; order?: 'desc' | 'asc' },
+  ): Promise<{ items: T[]; nextCursor?: string; total: number }> {
+    const limit = Math.max(1, Math.floor(opts.limit))
+    const direction = opts.order === 'asc' ? 1 : -1
+    scope = await resolveGraphScope(this, scope)
+    await ensureGraphConsistency(this, scope)
+    const keys = await this.rawListKeys(scope)
+    const ranked = keys.map((key) => ({ key, at: generatedIdTime(key) }))
+    const rank = (entry: { key: string; at: number | null }) =>
+      entry.at === null ? Number.NEGATIVE_INFINITY : entry.at
+    const compare = (a: { key: string; at: number | null }, b: { key: string; at: number | null }) => {
+      if (rank(a) !== rank(b)) return (rank(a) - rank(b)) * direction
+      return (a.key < b.key ? -1 : a.key > b.key ? 1 : 0) * direction
     }
+    ranked.sort(compare)
+    const position = decodeCursor(opts.cursor)
+    let start = 0
+    if (position?.key) {
+      const at = generatedIdTime(position.key)
+      start = ranked.findIndex((entry) => compare(entry, { key: position.key!, at }) > 0)
+      if (start < 0) start = ranked.length
+    }
+    const pageKeys = ranked.slice(start, start + limit).map((entry) => entry.key)
+    const values = await this.rawGetMany<T>(scope, pageKeys, 16, await this.isPartitioned(scope))
+    const items = values.filter((value): value is T => value !== null && value !== undefined)
+    const hasMore = start + pageKeys.length < ranked.length
+    return {
+      items,
+      total: ranked.length,
+      ...(hasMore && pageKeys.length
+        ? { nextCursor: encodeCursor({ key: pageKeys[pageKeys.length - 1]! }) }
+        : {}),
+    }
+  }
+
+  async listGroups(): Promise<string[]> {
+    const result = await this.sdk.trigger<Record<string, never>, { groups?: unknown } | null>({
+      function_id: 'state::list_groups',
+      payload: {},
+    })
+    const groups = result?.groups
+    if (!Array.isArray(groups) || !groups.every((group) => typeof group === 'string')) {
+      throw new Error('state::list_groups returned an unexpected shape')
+    }
+    return groups
   }
 }

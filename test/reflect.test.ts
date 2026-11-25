@@ -160,14 +160,14 @@ describe("Reflect", () => {
     it("限制新概念簇和证据集合，避免重新生成超大的来源数组", async () => {
       const fact = Array.from({ length: 150 }, (_, i) => `concept${i}`).join(' ');
       for (let i = 0; i < 100; i++) await kv.set(KV.semantic, `sem_${i}`, makeSemantic(fact, `sem_${i}`));
-      provider.summarize.mockResolvedValue('<insights><insight confidence="0.8" title="Bounded" sources="F1,F64">Bounded evidence.</insight></insights>');
+      provider.summarize.mockResolvedValue('<insights><insight confidence="0.8" title="Bounded" sources="F1,F2">Bounded evidence.</insight></insights>');
       expect(await sdk.trigger('mem::reflect', { maxClusters: 1 })).toMatchObject({ newInsights: 1 });
       const [saved] = await kv.list<Insight>(KV.insights);
-      expect(saved.tags).toHaveLength(64);
+      expect(saved.tags).toHaveLength(32);
       expect(saved.sourceMemoryIds).toHaveLength(2);
       const prompt = provider.summarize.mock.calls[0][1] as string;
-      expect(prompt).toContain('"source":"F64"');
-      expect(prompt).not.toContain('"source":"F65"');
+      expect(prompt).toContain('"source":"F2"');
+      expect(prompt).not.toContain('"source":"F21"');
     });
 
     async function seedFacts() {
