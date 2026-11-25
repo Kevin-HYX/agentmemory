@@ -63,7 +63,7 @@ const shared = {
 
 export default defineConfig([
   {
-    entry: ["src/index.ts"],
+    entry: ["src/index.ts", "src/functions/reflection-worker.ts"],
     outDir: "dist",
     ...shared,
     dts: true,

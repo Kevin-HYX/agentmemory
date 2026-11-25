@@ -217,10 +217,10 @@ async function install() {
   const binDir = join(runtime, "bin"); mkdirSync(binDir);
   copyFileSync(engine, join(binDir, "iii")); chmodSync(join(binDir, "iii"), 0o755);
 }
-async function rest(path, body, { auth = true, expectedStatus = 200 } = {}) {
+async function rest(path, body, { auth = true, expectedStatus = 200, timeoutMs = 30_000 } = {}) {
   const headers = { "content-type": "application/json" };
   if (auth) headers.authorization = `Bearer ${secret}`;
-  const response = await fetch(`http://127.0.0.1:${port}/agentmemory${path}`, { method: body === undefined ? "GET" : "POST", headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(30_000) });
+  const response = await fetch(`http://127.0.0.1:${port}/agentmemory${path}`, { method: body === undefined ? "GET" : "POST", headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
   const text = await response.text();
   let json;
   try { json = JSON.parse(text); } catch { json = text; }
@@ -259,7 +259,7 @@ function fixture() {
   const now = new Date().toISOString();
   const semanticMemories = ["ALPHA", "BETA", "GAMMA"].map((marker) => ({ id: `fact-${marker.toLowerCase()}`, fact: `FACT_${marker} checkpoint rotation validation`, confidence: 0.9, sourceSessionIds: [], sourceMemoryIds: [], accessCount: 0, lastAccessedAt: now, strength: 1, createdAt: now, updatedAt: now }));
   const lessons = ["a", "b"].flatMap((project) => ["SELECTED", "UNCITED"].map((marker) => ({ id: `lesson-${project}-${marker.toLowerCase()}`, content: `LESSON_${marker} checkpoint rotation practice for project ${project}`, context: "Synthetic fixture", confidence: 0.9, reinforcements: 0, source: "manual", sourceIds: [], project: `reflection-${project}`, tags: ["checkpoint", "rotation"], createdAt: now, updatedAt: now, decayRate: 0.05 })));
-  const crystals = ["SELECTED", "UNCITED"].map((marker) => ({ id: `crystal-${marker.toLowerCase()}`, narrative: `CRYSTAL_${marker} checkpoint rotation summary`, keyOutcomes: [], filesAffected: [], lessons: ["checkpoint rotation"], sourceActionIds: [], createdAt: now }));
+  const crystals = ["a", "b"].flatMap((project) => ["SELECTED", "UNCITED"].map((marker) => ({ id: `crystal-${project}-${marker.toLowerCase()}`, narrative: `CRYSTAL_${marker} checkpoint rotation summary`, project: `reflection-${project}`, keyOutcomes: [], filesAffected: [], lessons: ["checkpoint rotation"], sourceActionIds: [], createdAt: now })));
   const graphNodes = ["checkpoint", "rotation"].map((name) => ({ id: `node-${name}`, name, type: "concept", properties: {}, sourceObservationIds: [], createdAt: now, updatedAt: now }));
   const graphEdges = [{ id: "edge-checkpoint-rotation", sourceNodeId: "node-checkpoint", targetNodeId: "node-rotation", type: "related_to", weight: 1, sourceObservationIds: [], createdAt: now }];
   return { version: installed.version, exportedAt: now, sessions: [], observations: {}, memories: [], summaries: [], semanticMemories, lessons, crystals, graphNodes, graphEdges };
@@ -310,7 +310,7 @@ function verifyEvidence(insight, project, includeLesson = true) {
   assert.equal(insight.evidenceVersion, 1);
   assert.deepEqual(insight.sourceMemoryIds, ["fact-alpha"]);
   assert.deepEqual(insight.sourceLessonIds, includeLesson ? [`lesson-${project}-selected`] : []);
-  assert.deepEqual(insight.sourceCrystalIds, ["crystal-selected"]);
+  assert.deepEqual(insight.sourceCrystalIds, [`crystal-${project}-selected`]);
   assert.equal(insight.project, `reflection-${project}`);
 }
 async function scenario(name, run) {
@@ -331,6 +331,47 @@ async function main() {
   await install();
   await startDaemon();
   await startBridge();
+  await scenario("jaccard-worker-keeps-health-and-search-responsive", async () => {
+    const base = { ...fixture(), semanticMemories: [], lessons: [], crystals: [], graphNodes: [], graphEdges: [] };
+    const [template] = fixture().semanticMemories;
+    const facts = Array.from({ length: 24_000 }, (_, i) => ({
+      ...template, id: "worker-fact-" + i, fact: "synthetic" + Math.floor(i / 2),
+    }));
+    for (let offset = 0; offset < facts.length; offset += 4000) {
+      const result = await rest("/import", {
+        exportData: { ...base, semanticMemories: facts.slice(offset, offset + 4000) },
+        strategy: offset === 0 ? "replace" : "merge",
+      }, { timeoutMs: 120_000 });
+      assert.equal(result.success, true, JSON.stringify(result));
+    }
+    const query = "isolated clustering health marker";
+    await rest("/remember", { content: query }, { expectedStatus: 201 });
+    let finished = false;
+    const start = performance.now();
+    const reflection = rest("/reflect", { maxClusters: 1 }).finally(() => { finished = true; });
+    const health = [];
+    let searches = 0;
+    try {
+      while (!finished) {
+        const sent = performance.now();
+        await rest("/livez", undefined, { auth: false, timeoutMs: 1000 });
+        health.push(performance.now() - sent);
+        if (!finished && health.length % 4 === 0) {
+          const search = await rest("/search", { query, limit: 1, format: "compact" }, { timeoutMs: 1000 });
+          assert.equal(search.results.length, 1);
+          if (!finished) searches++;
+        }
+        if (!finished) await sleep(80);
+      }
+    } finally {
+      const result = await reflection;
+      assert.equal(result.success, true, JSON.stringify(result));
+      assert.equal(result.clusterStrategy, "jaccard");
+    }
+    assert(health.length >= 4 && searches > 0, "Expected live health and search responses during reflection");
+    log("Reflection work " + Math.round(performance.now() - start) + "ms; health " + health.length +
+      " samples, max " + Math.round(Math.max(...health)) + "ms; overlapping searches " + searches);
+  });
   for (const mode of ["missing", "forged", "duplicate", "malformed"]) {
     await scenario(`reject-${mode}-evidence`, async () => {
       await seed(); modelMode = mode;

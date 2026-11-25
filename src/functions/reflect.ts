@@ -17,6 +17,7 @@ import type {
   Session,
 } from "../types.js";
 import { recordAudit } from "./audit.js";
+import { clusterReflection, ReflectionClusteringError } from "./reflection-clustering.js";
 import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { checkPayloadFrameSize, payloadByteLength } from "../state/frame-guard.js";
@@ -287,64 +288,6 @@ function buildGraphClusters(
   return clusters;
 }
 
-function buildJaccardClusters(
-  semanticMemories: SemanticMemory[],
-  lessons: Lesson[],
-  maxClusters: number,
-): string[][] {
-  const allConcepts = new Map<string, Set<string>>();
-
-  for (const sem of semanticMemories) {
-    const terms = sem.fact.toLowerCase().split(/\s+/).filter((t) => t.length > 3);
-    for (const term of terms) {
-      if (!allConcepts.has(term)) allConcepts.set(term, new Set());
-      allConcepts.get(term)!.add(sem.id);
-    }
-  }
-  for (const lesson of lessons) {
-    for (const tag of lesson.tags) {
-      const key = tag.toLowerCase();
-      if (!allConcepts.has(key)) allConcepts.set(key, new Set());
-      allConcepts.get(key)!.add(lesson.id);
-    }
-  }
-
-  const conceptList = [...allConcepts.keys()].filter(
-    (k) => (allConcepts.get(k)?.size || 0) >= 2,
-  );
-
-  const visited = new Set<string>();
-  const clusters: string[][] = [];
-
-  for (const concept of conceptList) {
-    if (visited.has(concept) || clusters.length >= maxClusters) break;
-
-    const cluster = [concept];
-    visited.add(concept);
-
-    const docsA = allConcepts.get(concept) || new Set();
-    for (const other of conceptList) {
-      if (cluster.length >= REFLECT_MAX_CONCEPTS) break;
-      if (visited.has(other)) continue;
-      const docsB = allConcepts.get(other) || new Set();
-      let intersection = 0;
-      for (const d of docsA) {
-        if (docsB.has(d)) intersection++;
-      }
-      const union = docsA.size + docsB.size - intersection;
-      const similarity = union > 0 ? intersection / union : 0;
-      if (similarity > 0.3) {
-        cluster.push(other);
-        visited.add(other);
-      }
-    }
-
-    if (cluster.length >= 2) clusters.push(cluster);
-  }
-
-  return clusters;
-}
-
 export function registerReflectFunctions(
   sdk: IIIClient,
   state: StateKV,
@@ -383,11 +326,14 @@ export function registerReflectFunctions(
       const clusterStrategy = conceptClusters.length === 0 ? "jaccard" : "graph";
       const usedFallback = clusterStrategy === "jaccard";
       if (usedFallback) {
-        conceptClusters = buildJaccardClusters(
-          semanticMemories,
-          activeLessons,
-          maxClusters,
-        );
+        try {
+          conceptClusters = await clusterReflection(semanticMemories, activeLessons, {
+            maxClusters, maxConcepts: REFLECT_MAX_CONCEPTS,
+          });
+        } catch (error) {
+          if (!(error instanceof ReflectionClusteringError)) throw error;
+          return { success: false, error: error.message, code: error.code, clusterStrategy, usedFallback };
+        }
       }
 
       let newInsights = 0;
