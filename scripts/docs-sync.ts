@@ -3,13 +3,14 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ESSENTIAL_TOOLS, getAllTools } from "../src/mcp/tools-registry.js";
+import { renderReadmeDiagrams, type DiagramFacts } from "./readme-diagrams.js";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const STATE_PATH = "scripts/docs-sync.state.json";
 const CHECK = process.argv.includes("--check");
 const REPO_URL = "https://github.com/rohitg00/agentmemory";
 
-type State = { version: string; facts: Record<string, string[]> };
+type State = { version: string; engineVersion?: string; facts: Record<string, string[]> };
 
 interface Fact {
   key: string;
@@ -18,6 +19,7 @@ interface Fact {
   nouns: string[];
   before?: string;
   badge?: string;
+  legacyValues?: string[];
 }
 
 function read(path: string): string {
@@ -53,6 +55,49 @@ function countFallbackTools(): number {
   const src = read("src/mcp/standalone.ts");
   const body = src.slice(src.indexOf("const IMPLEMENTED_TOOLS = new Set(["));
   return (body.slice(0, body.indexOf("]);")).match(/"memory_\w+"/g) ?? []).length;
+}
+
+function sourceNumber(path: string, pattern: RegExp, problems: string[]): number {
+  const match = read(path).match(pattern);
+  if (!match) problems.push(`${path} no longer matches ${pattern}`);
+  return match ? Number(match[1]) : 0;
+}
+
+function countInBlock(path: string, start: string, item: RegExp, problems: string[]): number {
+  const src = read(path);
+  const at = src.indexOf(start);
+  if (at < 0) {
+    problems.push(`${path} no longer contains ${start}`);
+    return 0;
+  }
+  const body = src.slice(at, src.indexOf("\n  ];", at));
+  return body.match(item)?.length ?? 0;
+}
+
+function diagramFacts(problems: string[]): DiagramFacts {
+  const restPort = sourceNumber("src/config.ts", /env\["III_REST_PORT"\] \|\| "(\d+)"/, problems);
+  return {
+    restPort,
+    viewerPort: restPort + sourceNumber("src/config.ts", /\|\| restPort \+ (\d+);/, problems),
+    restEndpoints: Number(FACTS.find((f) => f.key === "restEndpoints")!.value()),
+    mcpTools: getAllTools().length,
+    resources: countInBlock("src/mcp/server.ts", "const MCP_RESOURCES = [", /uri: "agentmemory:\/\//g, problems),
+    prompts: countInBlock("src/mcp/server.ts", "const MCP_PROMPTS = [", /^ {4}\{/gm, problems),
+    hooks: countHookTypes(),
+    rrfK: sourceNumber("src/state/hybrid-search.ts", /const RRF_K = (\d+);/, problems),
+    tokenBudget: sourceNumber("src/config.ts", /tokenBudget: safeParseInt\(env\["TOKEN_BUDGET"\], (\d+)\)/, problems),
+    maxPerSession: sourceNumber("src/state/hybrid-search.ts", /maxPerSession = (\d+)/, problems),
+  };
+}
+
+function checkDiagramNames(svgs: Record<string, string>, problems: string[]): void {
+  const source = sourceFiles().map(read).join("\n");
+  for (const [path, svg] of Object.entries(svgs)) {
+    const names = new Set(svg.replace(/<style>[\s\S]*?<\/style>/, "").match(/\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g) ?? []);
+    for (const name of names) {
+      if (!new RegExp(`\\b${name}\\b`).test(source)) problems.push(`${path} names ${name}, which no longer appears in src/`);
+    }
+  }
 }
 
 function sourceFiles(): string[] {
@@ -103,7 +148,11 @@ const FACTS: Fact[] = [
   {
     key: "restEndpoints",
     label: "REST endpoints",
-    value: () => String(countMatches("src/triggers/api.ts", /api_path:\s*["`]/g)),
+    value: () => String(
+      countMatches("src/triggers/api.ts", /api_path:\s*["`]/g) +
+      countMatches("src/triggers/viewer-sse.ts", /api_path:\s*["`]/g) +
+      countMatches("src/triggers/viewer-streams.ts", /api_path:\s*["`]/g),
+    ),
     nouns: [
       "REST endpoints", "REST API endpoints", "endpoints", "endpoint", "Endpunkte", "эндпоинт", "个端点", "個端點", "개 엔드포인트", "개의 엔드포인트", "エンドポイント",
       "uç nokta", "एंडपॉइंट", "endepunkt", "de endpoint", "ендпоінт", "na endpoint", "اینڈ پوائنٹ", "نقطة نهاية", "এন্ডপয়েন্ট", "개",
@@ -135,6 +184,7 @@ const FACTS: Fact[] = [
   {
     key: "tests",
     label: "tests",
+    legacyValues: ["3000+", "3400+"],
     value: () => {
       const n = countTests();
       return n === null ? null : `${floorTo(n, 100)}+`;
@@ -149,6 +199,7 @@ const FACTS: Fact[] = [
   {
     key: "functions",
     label: "iii functions",
+    legacyValues: ["324"],
     value: () => String(sourceFiles().reduce((n, f) => n + (read(f).match(/registerFunction\(/g)?.length ?? 0), 0)),
     nouns: [
       "iii functions", "functions", "funciones", "funções", "fonctions", "Funktionen", "функци", "個函式", "个函数", "개 함수", "개의 함수", "fonksiyon", "funkc",
@@ -159,12 +210,13 @@ const FACTS: Fact[] = [
   {
     key: "sourceFiles",
     label: "source files",
+    legacyValues: ["242", "246"],
     value: () => String(sourceFiles().length),
     nouns: [
       "source files", "fichiers sources", "ficheros de código", "arquivos de código", "archivos fuente", "arquivos-fonte", "arquivos fonte",
       "fichiers source", "Quelldateien", "исходных файл", "個原始檔", "个源文件", "개 소스 파일", "개의 소스 파일", "ソースファイル", "kaynak dosya", "zdrojových soubor",
       "kildefiler", "αρχεία πηγαίου", "lähdetiedosto", "forrásfájl", "file sorgente", "bronbestand", "plików źródłowych", "ficheiros de código",
-      "fișiere sursă", "källkodsfiler", "source file", "na source file", "file source", "вихідних файл", "file sumber", "קבצי מקור", "ملف مصدري",
+      "fișiere sursă", "källkodsfiler", "source file", "na source file", "file source", "вихідних файл", "file sumber", "קבצי מקור", "קובצי מקור", "ملف مصدري",
       "سورس فائل", "সোর্স ফাইল", "개", "pliki źródłowe", "de fișiere sursă",
     ],
   },
@@ -178,6 +230,7 @@ const FACTS: Fact[] = [
   {
     key: "kvScopes",
     label: "KV scopes",
+    legacyValues: ["67"],
     value: () => String(countKvScopes()),
     nouns: [
       "KV scopes", "KV-Scopes", "KV scope", "KV-scope", "scopes KV", "scopes de KV", "escopos KV", "областей KV", "個 KV", "个 KV", "개 KV", "KV スコープ",
@@ -192,6 +245,7 @@ const EXCLUDED = [
   /^test\//,
   /^benchmark\//,
   /^docs\/benchmarks\//,
+  /^docs\/upgrades\//,
   /^eval\//,
   /^website\/lib\/generated-meta\.json$/,
   /(^|\/)package-lock\.json$/,
@@ -244,7 +298,6 @@ function replaceFact(text: string, fact: Fact, olds: string[], next: string): st
 
 const VERSION_FILES: Array<{ file: RegExp; pattern: (v: string) => RegExp; replace: (v: string) => string }> = [
   { file: /(^|\/)(package|plugin|openclaw\.plugin)\.json$/, pattern: (v) => new RegExp(`("version":\\s*")${escapeRegex(v)}(")`), replace: (v) => `$1${v}$2` },
-  { file: /^integrations\/hermes\/plugin\.yaml$/, pattern: (v) => new RegExp(`^(version:\\s*)${escapeRegex(v)}$`, "m"), replace: (v) => `$1${v}` },
   { file: /^deploy\/.*(Dockerfile|\.ya?ml)$/, pattern: (v) => new RegExp(`(AGENTMEMORY_VERSION[=:]\\s*"?|value:\\s*")${escapeRegex(v)}\\b`, "g"), replace: (v) => `$1${v}` },
   { file: /^src\/version\.ts$/, pattern: (v) => new RegExp(`(VERSION = ")${escapeRegex(v)}(")`), replace: (v) => `$1${v}$2` },
   { file: /^AGENTS\.md$/, pattern: (v) => new RegExp(`(## Current Stats \\(v)${escapeRegex(v)}(\\))`), replace: (v) => `$1${v}$2` },
@@ -287,7 +340,35 @@ function main(): void {
   const report: string[] = [];
   const failed: string[] = [];
 
-  const version = (JSON.parse(read("package.json")) as { version: string }).version;
+  const manifest = JSON.parse(read("package.json")) as { version: string; dependencies: Record<string, string> };
+  const version = manifest.version;
+  const engineVersion = manifest.dependencies["iii-sdk"];
+  if (!/^\d+\.\d+\.\d+$/.test(engineVersion) || manifest.dependencies["@iii-dev/helpers"] !== engineVersion) {
+    throw new Error("iii-sdk and @iii-dev/helpers must pin the same exact release.");
+  }
+  const previousEngineVersion = state.engineVersion ?? read("src/version.ts").match(/III_PINNED_VERSION = "([^"]+)"/)?.[1];
+  if (!previousEngineVersion) throw new Error("Could not read the previous engine pin.");
+  if (engineVersion !== previousEngineVersion) {
+    for (const extra of trackedFiles().filter((path) => path === ".env.example" || path === "eval/README.md" || /^examples\/python\/.*\.(py|md)$/.test(path) || path === "deploy/runtime/entrypoint.sh")) {
+      if (!files.has(extra)) files.set(extra, read(extra));
+      if (!original.has(extra)) original.set(extra, read(extra));
+    }
+    for (const [path, text] of files) {
+      if (path === "website/lib/generated-changelog.json") continue;
+      files.set(path, text.replaceAll(previousEngineVersion, engineVersion));
+    }
+    report.push(`engine: ${previousEngineVersion} -> ${engineVersion}`);
+  }
+  nextState.engineVersion = engineVersion;
+  const ompPath = "integrations/omp/package.json";
+  const ompManifest = files.get(ompPath);
+  if (ompManifest) {
+    files.set(ompPath, ompManifest.replace(/("version":\s*")[^"]+(")/, `$1${version}$2`));
+  }
+  for (const path of ["integrations/hermes/plugin.yaml", "integrations/openclaw/plugin.yaml"]) {
+    const pluginManifest = files.get(path);
+    if (pluginManifest) files.set(path, pluginManifest.replace(/^(version:\s*)[^\r\n]+$/m, `$1${version}`));
+  }
   if (version !== state.version) {
     for (const extra of ["src/types.ts", "src/functions/export-import.ts", "CHANGELOG.md"]) {
       if (!files.has(extra)) files.set(extra, read(extra));
@@ -305,7 +386,7 @@ function main(): void {
       failed.push(fact.label);
       continue;
     }
-    const olds = state.facts[fact.key] ?? [];
+    const olds = [...(state.facts[fact.key] ?? []), ...(fact.legacyValues ?? [])];
     if (olds.length === 1 && olds[0] === next) continue;
     for (const [path, text] of files) {
       if (fact.badge && path.endsWith(".svg") && !path.endsWith(fact.badge)) continue;
@@ -314,6 +395,20 @@ function main(): void {
     }
     report.push(`${fact.label}: ${olds.join(", ")} -> ${next}`);
     nextState.facts[fact.key] = [next];
+  }
+
+  const diagramProblems: string[] = [];
+  const diagrams = renderReadmeDiagrams(diagramFacts(diagramProblems));
+  checkDiagramNames(diagrams, diagramProblems);
+  if (diagramProblems.length > 0) {
+    for (const problem of diagramProblems) console.error(`docs-sync: README diagrams: ${problem}`);
+    console.error("Update scripts/readme-diagrams.ts or the source patterns in scripts/docs-sync.ts.");
+    process.exit(1);
+  }
+  for (const [path, svg] of Object.entries(diagrams)) {
+    if (!original.has(path)) original.set(path, existsSync(join(ROOT, path)) ? read(path) : "");
+    files.set(path, svg);
+    if (original.get(path) !== svg) report.push(`diagram: ${path}`);
   }
 
   const changed = [...files].filter(([p, t]) => original.get(p) !== t).map(([p]) => p);

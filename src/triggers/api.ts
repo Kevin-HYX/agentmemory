@@ -2,20 +2,21 @@ import { InvocationError, TriggerAction, type IIIClient } from "iii-sdk";
 import { DEDUP_WINDOW_MS, getDedupSkippedCount } from "../functions/dedup.js";
 import type { HttpRequest } from "@iii-dev/helpers/http";
 import { randomBytes } from "node:crypto";
-import type { Session, CompressedObservation, HookPayload, CommitLink, SessionSummary, HealthSnapshot, AuditQueryResult, AuditMigrationState } from "../types.js";
+import type { Session, CompressedObservation, HookPayload, CommitLink, SessionSummary, HealthSnapshot, AuditQueryResult, AuditMigrationState, Lesson } from "../types.js";
 import { AUDIT_MIGRATION_STATE_KEY } from "../functions/audit.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { KV } from "../state/schema.js";
 import { isSearchLayer, type SearchLayer } from "../state/search-layer.js";
-import { checkPayloadFrameSize } from "../state/frame-guard.js";
-import { StateKV } from "../state/kv.js";
+import { checkPayloadFrameSize, oversizedPayloadError, payloadByteLength, SAFE_PAYLOAD_BYTES } from "../state/frame-guard.js";
+import { insightHttpResponse } from "../state/insight-response.js";
+import { StateKV, collectAll } from "../state/kv.js";
 import { pinGraphState } from "../state/graph-generation.js";
 import { addSessionToProjectIndex } from "../state/session-index.js";
 import { getLatestHealth } from "../health/monitor.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import type { ResilientProvider } from "../providers/resilient.js";
 import { III_PINNED_VERSION, VERSION } from "../version.js";
-import { CONSOLIDATION_COUNTS_REUSE_MS, CONSOLIDATION_LAST_RUN_KEY, PROCEDURAL_MIN_SESSIONS_PER_PATTERN, describeConsolidation, type ConsolidationRunRecord, type ConsolidationStatus } from "../functions/consolidation-status.js";
+import { CONSOLIDATION_COUNTS_REUSE_MS, CONSOLIDATION_LAST_RUN_KEY, PROCEDURAL_MIN_SESSIONS_PER_PATTERN, describeConsolidation, patternFrequency, type ConsolidationRunRecord, type ConsolidationStatus } from "../functions/consolidation-status.js";
 import { UNINDEXED_SCAN_REUSE_MS, evaluateStatus, prefersHtml, renderStatusHtml, singleFlight, type GraphStatsInput, type StatusReport } from "../functions/status.js";
 import {
   findUnindexedObservations,
@@ -28,15 +29,19 @@ import {
   getSearchIndex,
   getVectorIndex,
   isBm25RebuildIncomplete,
+  getKeywordRetryStatus,
   rankMemoryIds,
 } from "../functions/search.js";
 import {
   LIST_PAGE_MAX,
+  decodeCursor,
   encodeCursor,
   matchesText,
   pageAfterCursor,
   pageByOffset,
   parseListQuery,
+  parseTimeBounds,
+  inTimeRange,
   sortByKeyDesc,
 } from "../state/list-query.js";
 import { checkRequestGuard, configuredAllowedOrigins, timingSafeCompare } from "../auth.js";
@@ -51,13 +56,15 @@ import { getGraphCompactBootStatus } from "../functions/graph-compact-boot.js";
 import { getGraphIndexMigrationStatus } from "../state/graph-index-migration.js";
 import { GraphIndexError } from "../state/graph-retrieval-index.js";
 import { registerGraphIndexApi } from "./graph-index-api.js";
+import { normalizeRememberFields, rememberFieldsError } from "../mcp/remember-arguments.js";
 import { LESSON_SOURCE_IDS_MAX, normalizeLessonSourceIds } from "../functions/lessons.js";
 import { logger } from "../logger.js";
+import { getLiveEventsStats } from "../viewer/live-events.js";
 import { isValidEventId } from "../capture/event-id.js";
 import { getCaptureController, type CaptureResult } from "../functions/capture.js";
 import { withoutObservationSource } from "../functions/observation-source.js";
 import { clearSessionFinalize, scheduleSessionFinalize } from "../functions/session-finalize.js";
-import { requestSummaryRefresh } from "../functions/summary-state.js";
+import { getSummaryTriggerTimeoutMs, requestSummaryRefresh } from "../functions/summary-state.js";
 import { registerCompressionApi } from "./compression.js";
 import {
   getFinalizeIdleMs,
@@ -68,9 +75,10 @@ import {
   getConsolidationDecayDays,
   isAutoCompressEnabled,
   isContextInjectionEnabled,
-  detectEmbeddingProvider,
   describeLlmRoute,
   detectLlmProviderKind,
+  llmOptInHint,
+  embeddingOptInHint,
   getAgentId,
   isAgentScopeIsolated,
   loadConfig,
@@ -163,7 +171,7 @@ function consolidationDisabledResponse(): Response {
   });
 }
 
-function slotsDisabledResponse(): Response {
+export function slotsDisabledResponse(): Response {
   return flagDisabledResponse({
     error: "Memory slots not enabled",
     flag: "AGENTMEMORY_SLOTS",
@@ -328,7 +336,7 @@ function sessionFacets(
 function describeEmbeddingProvider(): string {
   const active = getEmbeddingProvider();
   if (active) return `${active.name} (${active.dimensions} dims)`;
-  return detectEmbeddingProvider() ?? "none";
+  return "none";
 }
 
 const STATUS_CHECK_TIMEOUT_MS = 5000;
@@ -386,6 +394,7 @@ export function createStatusReporter(sdk: IIIClient, kv: StateKV, deps: StatusRe
   return async function statusReport(options: { health?: HealthSnapshot | null; scanMaxAgeMs?: number } = {}): Promise<StatusReport> {
     const idx = getSearchIndex();
     const keywordRebuildRunning = isKeywordRebuildInProgress();
+    const keywordRetry = getKeywordRetryStatus();
     const scan = unindexedScanFor(kv);
     const cached = scan.last && options.scanMaxAgeMs !== undefined && Date.now() - scan.last.at < options.scanMaxAgeMs
       ? scan.last.value
@@ -416,12 +425,11 @@ export function createStatusReporter(sdk: IIIClient, kv: StateKV, deps: StatusRe
     return evaluateStatus({
       now: new Date(),
       version: VERSION,
-      engineVersion: III_PINNED_VERSION,
+      enginePinnedVersion: III_PINNED_VERSION,
       uptimeSeconds: Math.round(process.uptime()),
       stateBackend: kv.backend === "redis" ? "redis" : "file",
       ports: {
         rest: config.restPort ?? null,
-        streams: config.streamsPort ?? null,
         viewer: getViewerSkipped() ? null : (getBoundViewerPort() ?? null),
       },
       health: health
@@ -439,7 +447,9 @@ export function createStatusReporter(sdk: IIIClient, kv: StateKV, deps: StatusRe
       llmRoute: describeLlmRoute(config.provider),
       functionMetrics: functionMetrics ?? [],
       provider: detectLlmProviderKind(),
+      providerHint: llmOptInHint(),
       embeddingProvider: describeEmbeddingProvider(),
+      embeddingHint: embeddingOptInHint(),
       flags: buildConfigFlags(),
       index: {
         bm25Documents: idx.size,
@@ -450,6 +460,8 @@ export function createStatusReporter(sdk: IIIClient, kv: StateKV, deps: StatusRe
         missingObservations: unindexed ? unindexed.missing.length : null,
         sessions: unindexed ? unindexed.sessions : null,
         bm25Incomplete: isBm25RebuildIncomplete(),
+        bm25FailedSessions: keywordRetry.failedSessions,
+        bm25NextRetryAt: keywordRetry.nextRetryAt,
         keywordRebuildRunning,
         pendingVectorBackfill: getPendingVectorBackfillCount(),
         vectorBackfillState: getVectorBackfillState(),
@@ -469,22 +481,26 @@ export function createStatusReporter(sdk: IIIClient, kv: StateKV, deps: StatusRe
   };
 }
 
+async function countConsolidationSummaries(kv: StateKV): Promise<number> {
+  return typeof kv.count === "function" ? kv.count(KV.summaries) : (await kv.list(KV.summaries)).length;
+}
+
 export function createConsolidationStatusReader(kv: StateKV) {
   const counts = singleFlight(async () => {
     const [summaries, memories, semantic, procedural, relations] = await Promise.all([
-      kv.list(KV.summaries).catch(() => []),
-      kv.list<import("../types.js").Memory>(KV.memories).catch(() => []),
-      kv.list(KV.semantic).catch(() => []),
-      kv.list(KV.procedural).catch(() => []),
-      kv.list(KV.relations).catch(() => []),
+      countConsolidationSummaries(kv).catch(() => 0),
+      collectAll<import("../types.js").Memory>(kv, KV.memories).catch(() => []),
+      collectAll(kv, KV.semantic).catch(() => []),
+      collectAll(kv, KV.procedural).catch(() => []),
+      collectAll(kv, KV.relations).catch(() => []),
     ]);
     return {
-      summaries: summaries.length,
+      summaries,
       recurringPatterns: memories.filter(
         (m) =>
           m.isLatest &&
           m.type === "pattern" &&
-          (m.sessionIds?.length ?? 0) >= PROCEDURAL_MIN_SESSIONS_PER_PATTERN,
+          patternFrequency(m) >= PROCEDURAL_MIN_SESSIONS_PER_PATTERN,
       ).length,
       semanticFacts: semantic.length,
       procedures: procedural.length,
@@ -518,6 +534,47 @@ function statusViewerUrl(req: HttpRequest, viewerPort: number | null): string {
   const host = typeof hostHeader === "string" ? hostHeader.replace(/:\d+$/, "") : "";
   if (viewerPort && host && /^[A-Za-z0-9.\-[\]:]+$/.test(host)) return `http://${host}:${viewerPort}/#health`;
   return "/agentmemory/viewer#health";
+}
+
+const RECORD_PAGE_BYTES = SAFE_PAYLOAD_BYTES - 1024 * 1024;
+
+async function listRecordPage<T extends { id: string }>(
+  kv: StateKV,
+  scope: string,
+  params: HttpRequest["query_params"],
+): Promise<{ items: T[]; nextCursor?: string }> {
+  const query = parseListQuery(params);
+  const limit = query.limit ?? LIST_PAGE_MAX;
+  let items: T[];
+  let more: boolean;
+  let storageCursor: string | undefined;
+  if (typeof kv.listPage === "function") {
+    const page = await kv.listPage<T>(scope, { limit, cursor: query.cursor });
+    items = page.items;
+    more = page.nextCursor !== undefined;
+    storageCursor = page.nextCursor;
+  } else {
+    const sorted = sortByKeyDesc(await collectAll<T>(kv, scope), (item) => item.id, (item) => item.id);
+    const page = pageAfterCursor(sorted, (item) => item.id, (item) => item.id, query.cursor, limit);
+    items = page.page;
+    more = page.nextCursor !== null;
+  }
+  let bytes = 0;
+  let kept = 0;
+  while (kept < items.length) {
+    const size = payloadByteLength(items[kept]) + 1;
+    if (kept > 0 && bytes + size > RECORD_PAGE_BYTES) break;
+    bytes += size;
+    kept++;
+  }
+  if (kept < items.length) {
+    items = items.slice(0, kept);
+    more = true;
+    storageCursor = undefined;
+  }
+  const last = items[items.length - 1];
+  const nextCursor = storageCursor ?? (more && last ? encodeCursor({ key: last.id, id: last.id }) : undefined);
+  return { items, ...(nextCursor ? { nextCursor } : {}) };
 }
 
 export function registerApiTriggers(
@@ -554,19 +611,13 @@ export function registerApiTriggers(
     },
   );
 
-  // Shared instance metadata for livez and health so the two never
-  // drift. streamsPort lets the viewer resolve its stream WebSocket
-  // target from the server instead of port arithmetic, which broke
-  // whenever the viewer bound a fallback port. Config is boot-static,
-  // so read it once instead of rebuilding the merged env per request.
+  // Config is boot-static, so read it once rather than rebuilding the merged env per request.
   const bootConfig = loadConfig();
-  const bootStreamsPort = bootConfig.streamsPort;
   setRestOriginPorts(() => [bootConfig.restPort, bootConfig.viewerPort, getBoundViewerPort()]);
   const instanceInfo = () => ({
     service: "agentmemory",
     viewerPort: getBoundViewerPort(),
     viewerSkipped: getViewerSkipped(),
-    streamsPort: bootStreamsPort,
   });
 
   sdk.registerFunction("api::liveness",
@@ -593,7 +644,9 @@ export function registerApiTriggers(
         body: {
           version: VERSION,
           provider: providerKind,
+          providerHint: llmOptInHint(),
           embeddingProvider,
+          embeddingHint: embeddingOptInHint(),
           flags,
         },
       };
@@ -610,7 +663,7 @@ export function registerApiTriggers(
   });
 
   sdk.registerFunction("api::health", 
-    async (req: HttpRequest): Promise<Response> => {
+    async (): Promise<Response> => {
       const health = await getLatestHealth(kv);
       const functionMetrics = metricsStore ? await metricsStore.getAll() : [];
       const circuitBreaker =
@@ -664,7 +717,7 @@ export function registerApiTriggers(
           body: renderStatusHtml(report, nonce, { viewerUrl: statusViewerUrl(req, report.service.ports.viewer) }),
         };
       }
-      return { status_code: 200, headers: { "Cache-Control": "no-store" }, body: report };
+      return { status_code: 200, headers: { "Cache-Control": "no-store" }, body: { ...report, liveEvents: getLiveEventsStats() } };
     },
   );
   sdk.registerTrigger({
@@ -1211,7 +1264,7 @@ export function registerApiTriggers(
       await clearSessionFinalize(kv, sessionId).catch(() => {});
       // Fan out session-stopped lifecycle (non-blocking).
       try {
-        sdk.trigger({
+        void sdk.trigger({
           function_id: "event::session::stopped",
           payload: { sessionId },
           action: TriggerAction.Void(),
@@ -1244,6 +1297,7 @@ export function registerApiTriggers(
       const result = await sdk.trigger({
         function_id: "mem::summarize",
         payload: { sessionId },
+        timeoutMs: getSummaryTriggerTimeoutMs(),
       });
       return { status_code: 200, body: result };
     },
@@ -1411,6 +1465,9 @@ export function registerApiTriggers(
         : explicitAgentId ??
           (isAgentScopeIsolated() ? getAgentId() : undefined);
       const listQuery = parseListQuery(req.query_params);
+      const time = parseTimeBounds(req.query_params);
+      if ("error" in time) return { status_code: 400, body: { error: time.error } };
+      const { startedAfter, startedBefore, endedAfter, endedBefore } = time.bounds;
       let filtered = filterAgentId
         ? validSessions.filter((s) => s.agentId === filterAgentId)
         : validSessions;
@@ -1424,6 +1481,11 @@ export function registerApiTriggers(
           : undefined;
       if (listQuery.project) filtered = filtered.filter((s) => s.project === listQuery.project);
       if (listQuery.status) filtered = filtered.filter((s) => s.status === listQuery.status);
+      filtered = filtered.filter(
+        (s) =>
+          inTimeRange(s.startedAt, startedAfter, startedBefore) &&
+          inTimeRange(s.endedAt, endedAfter, endedBefore),
+      );
       if (listQuery.q) {
         filtered = filtered.filter((s) =>
           matchesText(listQuery.q, s.id, s.project, s.cwd, s.firstPrompt, s.agentId),
@@ -1663,15 +1725,14 @@ export function registerApiTriggers(
       ) {
         return { status_code: 400, body: { error: "project must be a non-empty string" } };
       }
+      const fieldError = rememberFieldsError(req.body);
+      if (fieldError) return { status_code: 400, body: { error: fieldError } };
       const result = await sdk.trigger({
         function_id: "mem::remember",
         payload: {
           content: req.body.content,
           ...(req.body.type !== undefined && { type: req.body.type }),
-          ...(req.body.concepts !== undefined && { concepts: req.body.concepts }),
-          ...(req.body.files !== undefined && { files: req.body.files }),
-          ...(req.body.ttlDays !== undefined && { ttlDays: req.body.ttlDays }),
-          ...(req.body.sourceObservationIds !== undefined && { sourceObservationIds: req.body.sourceObservationIds }),
+          ...normalizeRememberFields(req.body),
           ...(req.body.project !== undefined && { project: req.body.project }),
           ...(typeof req.body.agentId === "string" && req.body.agentId.trim()
             ? { agentId: req.body.agentId.trim() }
@@ -2686,7 +2747,7 @@ export function registerApiTriggers(
     async (req: HttpRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const memories = await kv.list<import("../types.js").Memory>(KV.memories);
+      const memories = await collectAll<import("../types.js").Memory>(kv, KV.memories);
       const latest = req.query_params?.["latest"] === "true";
       // agentId filter. Request param wins, env AGENT_ID (when
       // scope=isolated) is the fallback. Shared mode keeps the tag but
@@ -2811,18 +2872,18 @@ export function registerApiTriggers(
         }
       }
 
-      return {
-        status_code: 200,
-        body: {
-          memories: sliced,
-          total: filtered.length,
-          offset,
-          limit: limit ?? null,
-          nextCursor,
-          ...(searchMode ? { search: { query: listQuery.q, mode: searchMode } } : {}),
-          ...(facets ? { facets } : {}),
-        },
+      const body = {
+        memories: sliced,
+        total: filtered.length,
+        offset,
+        limit: limit ?? null,
+        nextCursor,
+        ...(searchMode ? { search: { query: listQuery.q, mode: searchMode } } : {}),
+        ...(facets ? { facets } : {}),
       };
+      const oversized = checkPayloadFrameSize(body, "use ?limit and ?cursor to page");
+      if (oversized) return { status_code: 413, body: oversized };
+      return { status_code: 200, body };
     },
   );
   sdk.registerTrigger({
@@ -2856,8 +2917,11 @@ export function registerApiTriggers(
     async (req: HttpRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const semantic = await kv.list<import("../types.js").SemanticMemory>(KV.semantic);
-      return { status_code: 200, body: { semantic } };
+      const page = await listRecordPage<import("../types.js").SemanticMemory>(kv, KV.semantic, req.query_params);
+      const body = { semantic: page.items, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}) };
+      const oversized = checkPayloadFrameSize(body, "use ?limit and ?cursor to page");
+      if (oversized) return { status_code: 413, body: oversized };
+      return { status_code: 200, body };
     },
   );
   sdk.registerTrigger({
@@ -2870,8 +2934,11 @@ export function registerApiTriggers(
     async (req: HttpRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const procedural = await kv.list<import("../types.js").ProceduralMemory>(KV.procedural);
-      return { status_code: 200, body: { procedural } };
+      const page = await listRecordPage<import("../types.js").ProceduralMemory>(kv, KV.procedural, req.query_params);
+      const body = { procedural: page.items, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}) };
+      const oversized = checkPayloadFrameSize(body, "use ?limit and ?cursor to page");
+      if (oversized) return { status_code: 413, body: oversized };
+      return { status_code: 200, body };
     },
   );
   sdk.registerTrigger({
@@ -2899,8 +2966,11 @@ export function registerApiTriggers(
     async (req: HttpRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const relations = await kv.list<import("../types.js").MemoryRelation>(KV.relations);
-      return { status_code: 200, body: { relations } };
+      const relations = await collectAll<import("../types.js").MemoryRelation>(kv, KV.relations);
+      const body = { relations };
+      const oversized = checkPayloadFrameSize(body, "export relations with /mesh/export, which pages");
+      if (oversized) return { status_code: 413, body: oversized };
+      return { status_code: 200, body };
     },
   );
   sdk.registerTrigger({
@@ -3628,42 +3698,122 @@ export function registerApiTriggers(
         }
       }
       const project = req.query_params?.["project"] as string | undefined;
+      const rawLimit = Number(req.query_params?.["limit"]);
+      const pageLimit = Number.isFinite(rawLimit) && rawLimit >= 1 ? Math.min(Math.floor(rawLimit), 5000) : 500;
+      const cursorRaw = req.query_params?.["cursor"] as string | undefined;
+      const paged = req.query_params?.["limit"] !== undefined || cursorRaw !== undefined;
       const sinceTime = since ? new Date(since).getTime() : 0;
       const df = <T>(items: T[], field: "updatedAt" | "createdAt") =>
         items.filter((i) => new Date((i as Record<string, unknown>)[field] as string).getTime() > sinceTime);
-      let memories = await kv.list<import("../types.js").Memory>(KV.memories);
+      let memories = await collectAll<import("../types.js").Memory>(kv, KV.memories);
       let actions = await kv.list<import("../types.js").Action>(KV.actions);
       if (project) {
         memories = memories.filter((m) => m.project === project);
         actions = actions.filter((a) => a.project === project);
       }
-      const body: Record<string, unknown> = {
-        memories: df(memories, "updatedAt"),
-        actions: df(actions, "updatedAt"),
-      };
+      const collections: Array<[string, unknown[]]> = [
+        ["memories", df(memories, "updatedAt")],
+        ["actions", df(actions, "updatedAt")],
+      ];
       if (!project) {
         const graphState = await pinGraphState(kv);
-        const semantic = await kv.list<import("../types.js").SemanticMemory>(KV.semantic);
-        const procedural = await kv.list<import("../types.js").ProceduralMemory>(KV.procedural);
-        const relations = await kv.list<import("../types.js").MemoryRelation>(KV.relations);
-        const graphNodes = await graphState.list<import("../types.js").GraphNode>(KV.graphNodes);
-        const graphEdges = await graphState.list<import("../types.js").GraphEdge>(KV.graphEdges);
-        body.semantic = df(semantic, "updatedAt");
-        body.procedural = df(procedural, "updatedAt");
-        body.relations = df(relations, "createdAt");
-        body.graphNodes = graphNodes.filter(
-          (n) => new Date(n.updatedAt || n.createdAt).getTime() > sinceTime,
+        const semantic = await collectAll<import("../types.js").SemanticMemory>(kv, KV.semantic);
+        const procedural = await collectAll<import("../types.js").ProceduralMemory>(kv, KV.procedural);
+        const relations = await collectAll<import("../types.js").MemoryRelation>(kv, KV.relations);
+        const graphNodes = await collectAll<import("../types.js").GraphNode>(graphState, KV.graphNodes);
+        const graphEdges = await collectAll<import("../types.js").GraphEdge>(graphState, KV.graphEdges);
+        collections.push(
+          ["semantic", df(semantic, "updatedAt")],
+          ["procedural", df(procedural, "updatedAt")],
+          ["relations", df(relations, "createdAt")],
+          ["graphNodes", graphNodes.filter(
+            (n) => new Date(n.updatedAt || n.createdAt).getTime() > sinceTime,
+          )],
+          ["graphEdges", df(graphEdges, "createdAt")],
         );
-        body.graphEdges = df(graphEdges, "createdAt");
       }
-      // Fail an over-frame export with 413 instead of dropping the worker.
-      const oversized = checkPayloadFrameSize(
-        body,
-        "use ?since to fetch only changes after a timestamp, or ?project to scope the export",
-      );
-      if (oversized) {
-        return { status_code: 413, body: oversized };
+      const rowId = (row: unknown) => {
+        const r = row as { id?: unknown; sourceId?: unknown; targetId?: unknown; type?: unknown };
+        if (r.id !== undefined && r.id !== null) return String(r.id);
+        if (r.sourceId !== undefined) return `${String(r.sourceId)}:${String(r.targetId)}:${String(r.type)}`;
+        return "";
+      };
+      for (const [, rows] of collections) {
+        rows.sort((a, b) => (rowId(a) < rowId(b) ? -1 : rowId(a) > rowId(b) ? 1 : 0));
       }
+      let cursorPos: { c: number; after?: string } | null = null;
+      if (cursorRaw) {
+        try {
+          const parsed = JSON.parse(Buffer.from(cursorRaw, "base64url").toString("utf8"));
+          if (
+            parsed && typeof parsed === "object" &&
+            Number.isInteger(parsed.c) && parsed.c >= 0 && parsed.c < collections.length &&
+            (parsed.after === undefined || typeof parsed.after === "string")
+          ) {
+            cursorPos = { c: parsed.c, ...(parsed.after !== undefined ? { after: parsed.after } : {}) };
+          }
+        } catch {}
+        if (!cursorPos) return { status_code: 400, body: { error: "invalid_cursor" } };
+      }
+      for (const [name, rows] of collections) {
+        const unexportable = rows.some((row) => payloadByteLength(row) > SAFE_PAYLOAD_BYTES);
+        if (unexportable) {
+          return { status_code: 413, body: oversizedPayloadError(SAFE_PAYLOAD_BYTES + 1, `use ?since, ?project, or ?collections to exclude the oversized ${name} record`) };
+        }
+      }
+      if (!paged) {
+        const full = Object.fromEntries(collections);
+        const oversized = checkPayloadFrameSize(
+          full,
+          "use ?limit and ?cursor to page, ?since to fetch only changes after a timestamp, or ?project to scope the export",
+        );
+        if (oversized) return { status_code: 413, body: oversized };
+        return { status_code: 200, body: full };
+      }
+      let limit = pageLimit;
+      let body: Record<string, unknown> = {};
+      let nextCursor: string | undefined;
+      for (;;) {
+        body = Object.fromEntries(collections.map(([name]) => [name, []]));
+        nextCursor = undefined;
+        let remaining = limit;
+        let ci = cursorPos ? cursorPos.c : 0;
+        let after = cursorPos?.after;
+        for (; ci < collections.length && remaining > 0; ci++) {
+          const [name, rows] = collections[ci]!;
+          let start = 0;
+          if (after !== undefined) {
+            const resumeAfter = after;
+            start = rows.findIndex((row) => rowId(row) > resumeAfter);
+            if (start < 0) { after = undefined; continue; }
+          }
+          const take = Math.min(remaining, rows.length - start);
+          const slice = take > 0 ? rows.slice(start, start + take) : [];
+          body[name] = slice;
+          remaining -= take;
+          after = undefined;
+          if (start + take < rows.length) {
+            nextCursor = Buffer.from(JSON.stringify({ c: ci, after: rowId(slice[slice.length - 1]) })).toString("base64url");
+            break;
+          }
+        }
+        if (!nextCursor && remaining === 0) {
+          for (let c = ci; c < collections.length; c++) {
+            if (collections[c]![1].length > 0) {
+              nextCursor = Buffer.from(JSON.stringify({ c })).toString("base64url");
+              break;
+            }
+          }
+        }
+        const oversized = checkPayloadFrameSize(
+          body,
+          "use ?since to fetch only changes after a timestamp, ?cursor to page, or ?project to scope the export",
+        );
+        if (!oversized) break;
+        if (limit <= 1) return { status_code: 413, body: oversized };
+        limit = Math.max(1, Math.floor(limit / 2));
+      }
+      if (nextCursor) body.nextCursor = nextCursor;
       return { status_code: 200, body };
     },
   );
@@ -3679,12 +3829,17 @@ export function registerApiTriggers(
         runId?: string;
         actionIds?: string[];
         project?: string;
+        agentId?: string;
       }>,
     ): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      const body = req.body ?? {};
       try {
-        const result = await sdk.trigger({ function_id: "mem::flow-compress", payload: req.body || {} });
+        const result = await sdk.trigger({
+          function_id: "mem::flow-compress",
+          payload: { runId: body.runId, actionIds: body.actionIds, project: body.project, agentId: body.agentId },
+        });
         return { status_code: 200, body: result };
       } catch {
         return {
@@ -4073,6 +4228,25 @@ export function registerApiTriggers(
   });
   sdk.registerTrigger({ type: "http", function_id: "api::lesson-search", config: { api_path: "/agentmemory/lessons/search", http_method: "POST" } });
 
+  sdk.registerFunction("api::lesson-get", async (req: HttpRequest) => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const body = req.body as Record<string, unknown>;
+    const lessonId = typeof body?.lessonId === "string" ? body.lessonId.trim() : "";
+    if (!lessonId) return { status_code: 400, body: { error: "lessonId is required" } };
+    if (body.project !== undefined && typeof body.project !== "string") {
+      return { status_code: 400, body: { error: "project must be a string" } };
+    }
+    const project = typeof body.project === "string" ? body.project.trim() : "";
+    const lesson = await kv.get<Lesson>(KV.lessons, lessonId);
+    if (!lesson || lesson.deleted) return { status_code: 404, body: { error: "lesson not found" } };
+    if (lesson.project !== undefined && lesson.project !== project) {
+      return { status_code: 404, body: { error: "lesson not found" } };
+    }
+    return { status_code: 200, body: { success: true, lesson } };
+  });
+  sdk.registerTrigger({ type: "http", function_id: "api::lesson-get", config: { api_path: "/agentmemory/lessons/get", http_method: "POST" } });
+
   sdk.registerFunction("api::lesson-strengthen",  async (req: HttpRequest) => {
     const denied = checkAuth(req, secret);
     if (denied) return denied;
@@ -4121,9 +4295,9 @@ export function registerApiTriggers(
     const body = (req.body as Record<string, unknown>) || {};
     const result = await sdk.trigger({ function_id: "mem::reflect", payload: {
       project: typeof body.project === "string" ? body.project : undefined,
-      maxClusters: typeof body.maxClusters === "number" ? body.maxClusters : undefined,
+      maxClusters: body.maxClusters,
     } });
-    return { status_code: 200, body: result };
+    return insightHttpResponse(result);
   });
   sdk.registerTrigger({ type: "http", function_id: "api::reflect", config: { api_path: "/agentmemory/reflect", http_method: "POST" } });
 
@@ -4150,7 +4324,7 @@ export function registerApiTriggers(
       minConfidence,
       limit,
     } });
-    return { status_code: 200, body: result };
+    return insightHttpResponse(result);
   });
   sdk.registerTrigger({ type: "http", function_id: "api::insight-list", config: { api_path: "/agentmemory/insights", http_method: "GET" } });
 
@@ -4162,10 +4336,10 @@ export function registerApiTriggers(
     const result = await sdk.trigger({ function_id: "mem::insight-search", payload: {
       query: body.query,
       project: typeof body.project === "string" ? body.project : undefined,
-      minConfidence: typeof body.minConfidence === "number" ? body.minConfidence : undefined,
-      limit: typeof body.limit === "number" ? body.limit : undefined,
+      minConfidence: body.minConfidence,
+      limit: body.limit,
     } });
-    return { status_code: 200, body: result };
+    return insightHttpResponse(result);
   });
   sdk.registerTrigger({ type: "http", function_id: "api::insight-search", config: { api_path: "/agentmemory/insights/search", http_method: "POST" } });
 }

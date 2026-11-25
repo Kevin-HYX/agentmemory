@@ -88,26 +88,27 @@ export async function pinGraphState(kv: StateKV): Promise<StateKV> {
 }
 
 function graphView(kv: StateKV, id: string | null): StateKV {
-  const methods = new Set(["get", "set", "update", "delete", "list", "scan"]);
+  const methods = new Set(["get", "set", "update", "delete", "list", "listKeys", "count", "getMany", "scan", "iterate", "listPage"]);
   const view = new Proxy(kv, {
     get(target, property, receiver) {
       const value = Reflect.get(target, property, receiver);
-      if (typeof property !== "string" || !methods.has(property)) return value;
-      if (property === "scan") return async function* (scope: string) {
-        const iterator = value.call(target, physicalScope(scope, id));
-        const context = { kv: target, generation: id };
-        try {
-          while (true) {
-            const result = await pinned.run(context, () => iterator.next());
-            if (result.done) return;
-            yield result.value;
-          }
-        } finally {
-          await pinned.run(context, () => iterator.return(undefined));
-        }
-      };
+      if (typeof property !== "string" || typeof value !== "function" || !methods.has(property)) return value;
+      const ctx = { kv: target, generation: id };
+      if (property === "iterate" || property === "scan") {
+        return (scope: string, ...args: unknown[]) => {
+          const inner = pinned.run(ctx, () =>
+            (value as (s: string, ...a: unknown[]) => AsyncGenerator<unknown[]>).call(target, physicalScope(scope, id), ...args),
+          );
+          return {
+            [Symbol.asyncIterator]() { return this; },
+            next: (...a: unknown[]) => pinned.run(ctx, () => inner.next(...(a as []))),
+            return: (v?: unknown) => pinned.run(ctx, () => inner.return!(v)),
+            throw: (e?: unknown) => pinned.run(ctx, () => inner.throw!(e)),
+          };
+        };
+      }
       return (scope: string, ...args: unknown[]) => pinned.run(
-        { kv: target, generation: id },
+        ctx,
         () => value.call(target, physicalScope(scope, id), ...args),
       );
     },

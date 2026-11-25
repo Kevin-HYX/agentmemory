@@ -5,6 +5,7 @@ import type { Lesson } from "../types.js";
 import { SearchIndex } from "../state/search-index.js";
 import { lessonToObservation } from "../state/memory-utils.js";
 import { recordAudit } from "./audit.js";
+import { deleteFacetsForTargets } from "./facets.js";
 
 // Dedicated BM25 index for lessons, with the full records cached
 // alongside it. Recall previously listed every lesson from KV and
@@ -191,14 +192,17 @@ export function registerLessonsFunctions(sdk: IIIClient, kv: StateKV): void {
       const fetchLimit = filtering
         ? Math.max(limit * 10, 100)
         : Math.max(limit * 5, 50);
-      const hits = idx.search(data.query, fetchLimit);
+      const hits = idx.search(data.query, fetchLimit, "all", (id) => {
+        const lesson = lessonRecords.get(id);
+        if (!lesson || lesson.deleted || lesson.confidence < minConfidence) return false;
+        return !data.project || lesson.project === data.project;
+      });
       const maxHit = hits.length > 0 ? hits[0].score : 0;
 
       const scored: Array<{ lesson: Lesson; score: number }> = [];
       for (let i = 0; i < hits.length; i++) {
         const l = lessonRecords.get(hits[i].obsId);
-        if (!l || l.deleted || l.confidence < minConfidence) continue;
-        if (data.project && l.project !== data.project) continue;
+        if (!l) continue;
 
         const relevance = maxHit > 0 ? hits[i].score / maxHit : 0;
         const daysSinceReinforced = l.lastReinforcedAt
@@ -306,6 +310,7 @@ export function registerLessonsFunctions(sdk: IIIClient, kv: StateKV): void {
       lessonRecords.delete(lesson.id);
       if (lessonIndex) lessonIndex.remove(lesson.id);
       noteLessonMutation();
+      await deleteFacetsForTargets(kv, [lesson.id]);
 
       try {
         await recordAudit(kv, "lesson_delete", "mem::lesson-delete", [
@@ -373,8 +378,10 @@ export function registerLessonsFunctions(sdk: IIIClient, kv: StateKV): void {
       }
 
       await Promise.all(dirty.map((l) => kv.set(KV.lessons, l.id, l)));
+      const softDeletedIds: string[] = [];
       for (const l of dirty) {
         if (l.deleted) {
+          softDeletedIds.push(l.id);
           lessonRecords.delete(l.id);
           if (lessonIndex) lessonIndex.remove(l.id);
         } else {
@@ -382,6 +389,9 @@ export function registerLessonsFunctions(sdk: IIIClient, kv: StateKV): void {
         }
       }
       if (dirty.length > 0) noteLessonMutation();
+      if (softDeletedIds.length > 0) {
+        await deleteFacetsForTargets(kv, softDeletedIds);
+      }
       await Promise.all(
         auditEvents.map((event) =>
           recordAudit(kv, "lesson_strengthen", "mem::lesson-decay-sweep", [event.id], {

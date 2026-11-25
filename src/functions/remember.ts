@@ -2,17 +2,18 @@ import { TriggerAction, type IIIClient } from "iii-sdk";
 import { markCaptureEventDeleted } from "../capture/event-record.js";
 import type { Memory, Session } from "../types.js";
 import { KV, generateId, jaccardSimilarity } from "../state/schema.js";
-import { StateKV } from "../state/kv.js";
+import { StateKV, collectAll } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { removeSessionFromProjectIndex } from "../state/session-index.js";
 import { unindexObservationSession } from "../state/obs-index.js";
-import { memoryToObservation } from "../state/memory-utils.js";
+import { memoryToObservation, observationEmbedText, sharesMemoryScope, supersededAt } from "../state/memory-utils.js";
 import { deleteAccessLog } from "./access-tracker.js";
 import { deleteFacetsForTargets } from "./facets.js";
 import { recordAudit } from "./audit.js";
 import { getSearchIndex, getVectorIndex, isMemoryIndexReady, scheduleIndexSave, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave } from "./search.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
+import { TTL_TOO_LARGE, ttlExpiry } from "../mcp/remember-arguments.js";
 
 // Slicing by UTF-16 code unit can cut an astral character (emoji, some CJK
 // extensions) mid surrogate pair, leaving a lone high surrogate that renders
@@ -54,6 +55,9 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
       }
       if (data.sourceObservationIds && !Array.isArray(data.sourceObservationIds)) {
         return { success: false, error: "sourceObservationIds must be an array" };
+      }
+      if (typeof data.ttlDays === "number" && data.ttlDays > 0 && ttlExpiry(data.ttlDays) === null) {
+        return { success: false, error: TTL_TOO_LARGE };
       }
       const validTypes = new Set([
         "pattern",
@@ -108,7 +112,7 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
             );
             candidateMemories = loaded.filter((m): m is Memory => m !== null);
           } else {
-            candidateMemories = await kv.list<Memory>(KV.memories);
+            candidateMemories = await collectAll<Memory>(kv, KV.memories);
           }
         } catch (err) {
           // Candidate generation is an optimization; a failure here must
@@ -116,7 +120,7 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
           logger.warn("supersession candidate lookup failed, using full scan", {
             error: err instanceof Error ? err.message : JSON.stringify(err),
           });
-          candidateMemories = await kv.list<Memory>(KV.memories);
+          candidateMemories = await collectAll<Memory>(kv, KV.memories);
         }
         let supersededId: string | undefined;
         let supersededVersion = 1;
@@ -128,14 +132,7 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
         const lowerContent = data.content.toLowerCase();
         for (const existing of candidateMemories) {
           if (existing.isLatest === false) continue;
-          if ((existing.agentId || undefined) !== callAgentId) continue;
-          // Never supersede a memory that belongs to a different project.
-          // Both sides must have an explicit project for the guard to engage;
-          // an unscoped memory (legacy, no project field) is treated as a
-          // wildcard so pre-existing data is not stranded.
-          if (project && existing.project && existing.project !== project) {
-            continue;
-          }
+          if (!sharesMemoryScope(existing, { project, agentId: callAgentId })) continue;
           const similarity = jaccardSimilarity(
             lowerContent,
             existing.content.toLowerCase(),
@@ -166,6 +163,7 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
           sessionIds: [],
           strength: 7,
           version: supersededId ? supersededVersion + 1 : 1,
+          ...(supersededMemory ? { recurrence: (supersededMemory.recurrence ?? 1) + 1 } : {}),
           parentId: supersededId,
           supersedes: supersededId ? [supersededId] : [],
           sourceObservationIds: (data.sourceObservationIds || []).filter(
@@ -177,12 +175,12 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
           ...(project !== undefined && { project }),
         };
 
-        if (data.ttlDays && typeof data.ttlDays === "number" && data.ttlDays > 0) {
-          memory.forgetAfter = new Date(Date.now() + data.ttlDays * 86400000).toISOString();
-        }
+        const forgetAfter = typeof data.ttlDays === "number" && data.ttlDays > 0 ? ttlExpiry(data.ttlDays) : null;
+        if (forgetAfter) memory.forgetAfter = forgetAfter;
 
         if (supersededMemory) {
           supersededMemory.isLatest = false;
+          supersededMemory.updatedAt = supersededAt(supersededMemory.updatedAt, now);
           await kv.set(KV.memories, supersededMemory.id, supersededMemory);
           // The superseded version stays in KV (the viewer's version
           // chain reads it there) but leaves both search indexes:
@@ -210,7 +208,11 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
       await vectorIndexAddGuarded(
         memory.id,
         memory.sessionIds?.[0] ?? "memory",
-        memory.title + " " + memory.content,
+        observationEmbedText({
+          title: memory.title,
+          narrative: memory.content,
+          concepts: memory.concepts,
+        }),
         { kind: "memory", logId: memory.id },
         (embedding, isCurrent) =>
           withKeyedLock("mem:remember", async () => {
@@ -333,12 +335,15 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
       if (data.memoryId) {
         const memoryId = data.memoryId;
         await attempt(memoryId, async () => {
-          const mem = await kv.get<Memory>(KV.memories, memoryId);
+          const mem = await withKeyedLock("mem:remember", async () => {
+            const current = await kv.get<Memory>(KV.memories, memoryId);
+            if (current) await kv.delete(KV.memories, memoryId);
+            return current;
+          });
           if (!mem) {
             await deleteFacetsForTargets(kv, [memoryId]);
             return false;
           }
-          await kv.delete(KV.memories, memoryId);
           deletedMemoryIds.push(memoryId);
           getSearchIndex().remove(memoryId);
           vectorIndexRemove(memoryId);
@@ -401,6 +406,12 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
           } catch (err) {
             recordFailure(`summary:${sessionId}`, err);
           }
+        });
+      }
+
+      if (deletedObservationIds.length > 0) {
+        await deleteFacetsForTargets(kv, deletedObservationIds, {
+          targetTypes: ["memory", "observation"],
         });
       }
 

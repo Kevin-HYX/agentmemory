@@ -1,7 +1,7 @@
 import type { IIIClient } from "iii-sdk";
 import type { Memory } from "../types.js";
 import { KV } from "../state/schema.js";
-import { StateKV } from "../state/kv.js";
+import { StateKV, collectAll } from "../state/kv.js";
 import { logger } from "../logger.js";
 import { escapeXml } from "../prompts/xml.js";
 
@@ -25,11 +25,12 @@ export function registerEnrichFunction(sdk: IIIClient, kv: StateKV): void {
       const parts: string[] = [];
 
       const fileContextPromise = sdk
-        .trigger<{ sessionId: string; files: string[] }, { context: string }>({
+        .trigger<{ sessionId: string; files: string[]; project?: string }, { context: string }>({
           function_id: "mem::file-context",
           payload: {
             sessionId: data.sessionId,
             files: data.files,
+            ...(project !== undefined && { project }),
           },
         })
         .catch(() => ({ context: "" }));
@@ -56,8 +57,7 @@ export function registerEnrichFunction(sdk: IIIClient, kv: StateKV): void {
               .catch(() => ({ results: [] }))
           : Promise.resolve({ results: [] });
 
-      const bugMemoriesPromise = kv
-        .list<Memory>(KV.memories)
+      const bugMemoriesPromise = collectAll<Memory>(kv, KV.memories)
         .then((memories) =>
           memories
             .filter(

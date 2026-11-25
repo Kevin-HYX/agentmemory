@@ -1,8 +1,8 @@
-import { platform } from "node:os";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import type { ConnectAdapter, ConnectOptions, ConnectResult } from "./types.js";
 import { writeGuideline } from "./guidelines.js";
+import { mcpOnlyCaptureNotice } from "./capture-notice.js";
 import { adapter as antigravity } from "./antigravity.js";
 import { adapter as antigravityCli } from "./antigravity-cli.js";
 import { adapter as claudeCode } from "./claude-code.js";
@@ -20,6 +20,7 @@ import { adapter as kiro } from "./kiro.js";
 import { adapter as openclaw } from "./openclaw.js";
 import { adapter as opencode } from "./opencode.js";
 import { adapter as openhuman } from "./openhuman.js";
+import { adapter as omp } from "./omp.js";
 import { adapter as pi } from "./pi.js";
 import { adapter as qwen } from "./qwen.js";
 import { adapter as warp } from "./warp.js";
@@ -46,6 +47,7 @@ export const ADAPTERS: readonly ConnectAdapter[] = [
   openclaw,
   hermes,
   pi,
+  omp,
   openhuman,
 ];
 
@@ -127,6 +129,8 @@ export async function runAdapter(
         );
       }
     }
+    const captureNotice = mcpOnlyCaptureNotice(adapter, opts, result);
+    if (captureNotice) p.log.warn(captureNotice);
     return result;
   } catch (err) {
     p.log.error(
@@ -139,17 +143,6 @@ export async function runAdapter(
 export async function runConnect(args: string[]): Promise<void> {
   const { dryRun, force, all, withHooks, withMcp, guidelines, positional } =
     parseFlags(args);
-  const allowWindowsAdapter =
-    positional.length === 1 && positional[0]?.toLowerCase() === "copilot-cli";
-  if (platform() === "win32" && !allowWindowsAdapter) {
-    p.intro("agentmemory connect");
-    p.log.warn(
-      "Windows: automated `connect` is not supported yet. See https://github.com/rohitg00/agentmemory#other-agents for manual install steps.",
-    );
-    p.outro("Windows: manual install required — see docs");
-    return;
-  }
-
   const opts: ConnectOptions = { dryRun, force, withHooks, withMcp, guidelines };
 
   p.intro("agentmemory connect");
@@ -237,7 +230,7 @@ function summarize(
   }
 
   const wiredAny = results.some(
-    (r) => !["hermes", "hermes-agent", "openclaw", "claw"].includes(r.name) && (r.result.kind === "installed" || r.result.kind === "already-wired"),
+    (r) => !["hermes", "hermes-agent", "openclaw", "claw", "omp", "pi"].includes(r.name) && (r.result.kind === "installed" || r.result.kind === "already-wired"),
   );
   if (wiredAny) {
     p.log.info(

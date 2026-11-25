@@ -2,12 +2,13 @@ import type { IIIClient } from "iii-sdk";
 import type { Memory, GovernanceFilter, AuditEntry } from "../types.js";
 import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
+import { collectAll } from "../state/kv.js";
+import { deleteMemoryUnderLock } from "../state/memory-utils.js";
 import { recordAudit, safeAudit, queryAudit } from "./audit.js";
 import { deleteAccessLog } from "./access-tracker.js";
 import { deleteFacetsForTargets } from "./facets.js";
 import { getSearchIndex, vectorIndexRemove, flushIndexSave } from "./search.js";
 import { logger } from "../logger.js";
-
 const BULK_FILTER_KEYS = ["type", "dateFrom", "dateTo", "project", "qualityBelow"];
 const BULK_CONTROL_KEYS = ["dryRun", "reason"];
 
@@ -21,9 +22,7 @@ async function deleteMemoryRecord(
   kv: StateKV,
   id: string,
 ): Promise<"deleted" | "missing"> {
-  const mem = await kv.get<Memory>(KV.memories, id);
-  if (!mem) return "missing";
-  await kv.delete(KV.memories, id);
+  if (!(await deleteMemoryUnderLock(kv, KV.memories, id))) return "missing";
   await deleteAccessLog(kv, id);
   getSearchIndex().remove(id);
   vectorIndexRemove(id);
@@ -134,7 +133,7 @@ export function registerGovernanceFunction(sdk: IIIClient, kv: StateKV): void {
         };
       }
 
-      const memories = await kv.list<Memory>(KV.memories);
+      const memories = await collectAll<Memory>(kv, KV.memories);
       let candidates = memories;
 
       if (data.type && data.type.length > 0) {

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
 
 export class InMemoryKV {
@@ -33,8 +33,8 @@ export class InMemoryKV {
     return data;
   }
 
-  async delete(scope: string, key: string): Promise<void> {
-    this.store.get(scope)?.delete(key);
+  async delete(scope: string, key: string): Promise<boolean> {
+    return this.store.get(scope)?.delete(key) ?? false;
   }
 
   async list<T = unknown>(scope: string): Promise<T[]> {
@@ -51,7 +51,16 @@ export class InMemoryKV {
       for (const [scope, entries] of this.store) {
         data[scope] = Object.fromEntries(entries);
       }
-      writeFileSync(this.persistPath, JSON.stringify(data), "utf-8");
+      const tmpPath = `${this.persistPath}.${process.pid}.tmp`;
+      try {
+        writeFileSync(tmpPath, JSON.stringify(data), { encoding: "utf-8", mode: 0o600 });
+        renameSync(tmpPath, this.persistPath);
+      } catch (err) {
+        try {
+          rmSync(tmpPath, { force: true });
+        } catch {}
+        throw err;
+      }
       return true;
     } catch (err) {
       process.stderr.write(
